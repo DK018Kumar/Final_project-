@@ -280,15 +280,14 @@ class VisioEngine:
         except Exception:
             return None
 
-        bbox_before = self._get_shape_bbox(shp)
-        bbox_after = self._try_ungroup(shp)
-        target_bbox = bbox_after or bbox_before
-
-        if label_text and target_bbox:
+        bbox = self._get_shape_bbox(shp)
+        if label_text and bbox:
             try:
-                self._place_label_for_shape(page, None, label_text, bbox=target_bbox)
+                self._place_label_for_shape(page, None, label_text, bbox=bbox)
             except Exception:
                 pass
+
+        self._try_ungroup(shp)
         return shp
 
     def _get_shape_bbox(self, shp):
@@ -300,17 +299,39 @@ class VisioEngine:
             return None
 
     def _try_ungroup(self, shp):
-        new_bbox = None
         try:
             if shp is None:
                 return None
 
-            shape_type = getattr(shp, "Type", None)
-            if shape_type != constants.visTypeGroup:
+            if getattr(shp, "Type", None) != constants.visTypeGroup:
                 return None
 
             app = getattr(shp, "Application", None)
             window = app.ActiveWindow if app else None
+
+            prev_alert_enabled = None
+            prev_alert_response = None
+            resp_ok = getattr(constants, "visResponseOK", 1)
+
+            if app:
+                try:
+                    prev_alert_enabled = getattr(app, "AlertEnabled", None)
+                except Exception:
+                    prev_alert_enabled = None
+                try:
+                    prev_alert_response = getattr(app, "AlertResponse", None)
+                except Exception:
+                    prev_alert_response = None
+
+                try:
+                    app.AlertResponse = resp_ok
+                except Exception:
+                    pass
+                try:
+                    app.AlertEnabled = False
+                except Exception:
+                    pass
+
             selection = None
             if window:
                 try:
@@ -323,17 +344,25 @@ class VisioEngine:
             try:
                 if selection:
                     selection.Ungroup()
-                    try:
-                        new_bbox = selection.BoundingBox(constants.visBBoxUpright)
-                    except Exception:
-                        new_bbox = None
                 else:
                     shp.Ungroup()
             except Exception:
                 pass
+            finally:
+                if app:
+                    if prev_alert_enabled is not None:
+                        try:
+                            app.AlertEnabled = prev_alert_enabled
+                        except Exception:
+                            pass
+                    if prev_alert_response is not None:
+                        try:
+                            app.AlertResponse = prev_alert_response
+                        except Exception:
+                            pass
         except Exception:
             pass
-        return new_bbox
+        return None
 
     # Helper to place small bold label at top-left of a given shape (best-effort)
     def _place_label_for_shape(self, page, shp, label_text, bbox=None):
