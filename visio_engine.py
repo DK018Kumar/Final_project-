@@ -175,9 +175,13 @@ class VisioEngine:
             V_SPACING = 12.0
             FIRST_ROW_OFFSET = 15.0
 
-            custom_label = data.get("substation_label", "") or data.get("central_label", "")
+            custom_label = data.get("central_label")
+            if custom_label is None:
+                custom_label = data.get("substation_label", "")
             if isinstance(custom_label, str):
                 custom_label = custom_label.strip()
+            elif custom_label is not None:
+                custom_label = str(custom_label).strip()
             else:
                 custom_label = ""
 
@@ -220,13 +224,11 @@ class VisioEngine:
                     cell_name = ""
                     cell_label = ""
                     if isinstance(cell, dict):
-                        name_candidate = cell.get("name")
-                        if not name_candidate:
-                            name_candidate = cell.get("master") or cell.get("value")
+                        name_candidate = cell.get("name") or cell.get("master") or cell.get("value")
                         if isinstance(name_candidate, str):
                             cell_name = name_candidate.strip()
                         elif name_candidate is not None:
-                            cell_name = str(name_candidate)
+                            cell_name = str(name_candidate).strip()
 
                         lbl_candidate = cell.get("label", "")
                         if isinstance(lbl_candidate, str):
@@ -278,12 +280,15 @@ class VisioEngine:
         except Exception:
             return None
 
-        bbox = self._get_shape_bbox(shp)
-        self._try_ungroup(shp)
-        try:
-            self._place_label_for_shape(page, None, label_text, bbox=bbox)
-        except Exception:
-            pass
+        bbox_before = self._get_shape_bbox(shp)
+        bbox_after = self._try_ungroup(shp)
+        target_bbox = bbox_after or bbox_before
+
+        if label_text and target_bbox:
+            try:
+                self._place_label_for_shape(page, None, label_text, bbox=target_bbox)
+            except Exception:
+                pass
         return shp
 
     def _get_shape_bbox(self, shp):
@@ -295,29 +300,40 @@ class VisioEngine:
             return None
 
     def _try_ungroup(self, shp):
+        new_bbox = None
         try:
             if shp is None:
-                return
+                return None
 
             shape_type = getattr(shp, "Type", None)
-            if shape_type == constants.visTypeGroup:
-                try:
-                    shp.Ungroup()
-                    return
-                except Exception:
-                    pass
+            if shape_type != constants.visTypeGroup:
+                return None
 
+            app = getattr(shp, "Application", None)
+            window = app.ActiveWindow if app else None
+            selection = None
+            if window:
                 try:
-                    app = shp.Application
-                    window = app.ActiveWindow if app else None
-                    if window:
-                        window.DeselectAll()
-                        shp.Select(constants.visSelect)
-                        window.Selection.Ungroup()
+                    window.DeselectAll()
+                    shp.Select(constants.visSelect)
+                    selection = window.Selection
                 except Exception:
-                    pass
+                    selection = None
+
+            try:
+                if selection:
+                    selection.Ungroup()
+                    try:
+                        new_bbox = selection.BoundingBox(constants.visBBoxUpright)
+                    except Exception:
+                        new_bbox = None
+                else:
+                    shp.Ungroup()
+            except Exception:
+                pass
         except Exception:
             pass
+        return new_bbox
 
     # Helper to place small bold label at top-left of a given shape (best-effort)
     def _place_label_for_shape(self, page, shp, label_text, bbox=None):
@@ -346,6 +362,14 @@ class VisioEngine:
             # set text and style
             try:
                 t.Text = label_text
+            except Exception:
+                pass
+            try:
+                t.CellsU("LinePattern").FormulaU = "0"
+            except Exception:
+                pass
+            try:
+                t.CellsU("FillPattern").FormulaU = "0"
             except Exception:
                 pass
             # try to set bold for characters

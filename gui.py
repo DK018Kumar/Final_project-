@@ -38,8 +38,8 @@ class SubstationApp:
         self.cb_central.grid(row=1, column=1, sticky="w", padx=6)
 
         tk.Label(top, text="Central Label:").grid(row=2, column=0, sticky="w")
-        self.entry_substation_label = tk.Entry(top, width=40)
-        self.entry_substation_label.grid(row=2, column=1, sticky="w", padx=6, pady=(0, 8))
+        self.entry_central_label = tk.Entry(top, width=40)
+        self.entry_central_label.grid(row=2, column=1, sticky="w", padx=6, pady=(0, 8))
 
         tk.Label(top, text="Rows:").grid(row=3, column=0, sticky="w")
         self.entry_rows = tk.Entry(top, width=6)
@@ -177,7 +177,7 @@ class SubstationApp:
                 cb.pack(anchor="w", pady=(4, 2))
                 cb.current(0)
 
-                tk.Label(cell_frame, text="Label:", anchor="w").pack(anchor="w")
+                tk.Label(cell_frame, text="Custom Label:", anchor="w").pack(anchor="w")
                 entry_label = tk.Entry(cell_frame, width=34)
                 entry_label.pack(anchor="w", pady=(0, 4))
 
@@ -252,8 +252,14 @@ class SubstationApp:
                 })
             matrix.append(row_data)
 
-        label_text = self.entry_substation_label.get().strip()
-        data = {"central": central, "matrix_subs": matrix, "substation_label": label_text}
+        central_label = self.entry_central_label.get().strip()
+        data = {
+            "central": central,
+            "matrix_subs": matrix,
+            "central_label": central_label,
+            # maintain legacy key name for engine compatibility
+            "substation_label": central_label
+        }
         threading.Thread(target=self._thread_generate, args=(data,), daemon=True).start()
 
     def _thread_generate(self, data):
