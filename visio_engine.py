@@ -175,7 +175,7 @@ class VisioEngine:
             V_SPACING = 12.0
             FIRST_ROW_OFFSET = 15.0
 
-            custom_label = data.get("substation_label", "")
+            custom_label = data.get("substation_label", "") or data.get("central_label", "")
             if isinstance(custom_label, str):
                 custom_label = custom_label.strip()
             else:
@@ -198,18 +198,8 @@ class VisioEngine:
             if central_master is None:
                 raise Exception(f"Central master '{central_name}' not found.")
 
-            try:
-                central_shape = page.Drop(central_master, CENTRAL_X, CENTRAL_Y)
-            except Exception:
-                central_shape = None
-
-            # Add label for central (best-effort)
-            try:
-                if central_shape:
-                    label_text = custom_label if custom_label else central_name
-                    self._place_label_for_shape(page, central_shape, label_text)
-            except Exception:
-                pass
+            label_text = custom_label if custom_label else central_name
+            self._drop_shape_with_label(page, central_master, CENTRAL_X, CENTRAL_Y, label_text)
 
             # Matrix
             matrix = data.get("matrix_subs", [])
@@ -225,18 +215,41 @@ class VisioEngine:
             for r in range(rows):
                 y = CENTRAL_Y - FIRST_ROW_OFFSET - r * V_SPACING
                 for c in range(cols):
-                    name = matrix[r][c] if c < len(matrix[r]) else "None"
-                    if not name or name == "None":
+                    cell = matrix[r][c] if c < len(matrix[r]) else None
+
+                    cell_name = ""
+                    cell_label = ""
+                    if isinstance(cell, dict):
+                        name_candidate = cell.get("name")
+                        if not name_candidate:
+                            name_candidate = cell.get("master") or cell.get("value")
+                        if isinstance(name_candidate, str):
+                            cell_name = name_candidate.strip()
+                        elif name_candidate is not None:
+                            cell_name = str(name_candidate)
+
+                        lbl_candidate = cell.get("label", "")
+                        if isinstance(lbl_candidate, str):
+                            cell_label = lbl_candidate.strip()
+                        elif lbl_candidate is not None:
+                            cell_label = str(lbl_candidate).strip()
+                    else:
+                        if isinstance(cell, str):
+                            cell_name = cell.strip()
+                        elif cell is not None:
+                            cell_name = str(cell).strip()
+
+                    if not cell_name or cell_name.lower() == "none":
                         continue
 
                     # find master
                     try:
-                        m_obj = stencil.Masters.Item(name)
+                        m_obj = stencil.Masters.Item(cell_name)
                     except Exception:
                         m_obj = None
                         for item in stencil.Masters:
                             try:
-                                if self._normalize(item.Name).lower() == self._normalize(name).lower():
+                                if self._normalize(item.Name).lower() == self._normalize(cell_name).lower():
                                     m_obj = item
                                     break
                             except Exception:
@@ -246,19 +259,8 @@ class VisioEngine:
                         continue
 
                     x = start_x + c * H_SPACING
-                    try:
-                        shp = page.Drop(m_obj, x, y)
-                    except Exception:
-                        shp = None
-
-                    if shp is None:
-                        continue
-
-                    # place label in top-left of shp (best-effort)
-                    try:
-                        self._place_label_for_shape(page, shp, name)
-                    except Exception:
-                        pass
+                    label = cell_label if cell_label else cell_name
+                    self._drop_shape_with_label(page, m_obj, x, y, label)
 
             # Fit view
             try:
@@ -270,11 +272,61 @@ class VisioEngine:
         finally:
             pythoncom.CoUninitialize()
 
+    def _drop_shape_with_label(self, page, master, x, y, label_text):
+        try:
+            shp = page.Drop(master, x, y)
+        except Exception:
+            return None
+
+        bbox = self._get_shape_bbox(shp)
+        self._try_ungroup(shp)
+        try:
+            self._place_label_for_shape(page, None, label_text, bbox=bbox)
+        except Exception:
+            pass
+        return shp
+
+    def _get_shape_bbox(self, shp):
+        if shp is None:
+            return None
+        try:
+            return shp.BoundingBox(constants.visBBoxUpright)
+        except Exception:
+            return None
+
+    def _try_ungroup(self, shp):
+        try:
+            if shp is None:
+                return
+
+            shape_type = getattr(shp, "Type", None)
+            if shape_type == constants.visTypeGroup:
+                try:
+                    shp.Ungroup()
+                    return
+                except Exception:
+                    pass
+
+                try:
+                    app = shp.Application
+                    window = app.ActiveWindow if app else None
+                    if window:
+                        window.DeselectAll()
+                        shp.Select(constants.visSelect)
+                        window.Selection.Ungroup()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # Helper to place small bold label at top-left of a given shape (best-effort)
-    def _place_label_for_shape(self, page, shp, label_text):
+    def _place_label_for_shape(self, page, shp, label_text, bbox=None):
         try:
             # get bounding box: returns (Left, Bottom, Right, Top)
-            bbox = shp.BoundingBox(constants.visBBoxUpright)
+            if bbox is None:
+                bbox = self._get_shape_bbox(shp)
+            if not bbox:
+                return
             left = bbox[0]
             bottom = bbox[1]
             right = bbox[2]

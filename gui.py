@@ -37,7 +37,7 @@ class SubstationApp:
         self.cb_central = ttk.Combobox(top, state="readonly", width=60)
         self.cb_central.grid(row=1, column=1, sticky="w", padx=6)
 
-        tk.Label(top, text="Substation Label:").grid(row=2, column=0, sticky="w")
+        tk.Label(top, text="Central Label:").grid(row=2, column=0, sticky="w")
         self.entry_substation_label = tk.Entry(top, width=40)
         self.entry_substation_label.grid(row=2, column=1, sticky="w", padx=6, pady=(0, 8))
 
@@ -177,19 +177,24 @@ class SubstationApp:
                 cb.pack(anchor="w", pady=(4, 2))
                 cb.current(0)
 
+                tk.Label(cell_frame, text="Label:", anchor="w").pack(anchor="w")
+                entry_label = tk.Entry(cell_frame, width=34)
+                entry_label.pack(anchor="w", pady=(0, 4))
+
                 props_frame = tk.Frame(cell_frame)
                 props_frame.pack(anchor="w", fill="x", pady=(4, 0))
 
                 # bind selection event
-                cb.bind("<<ComboboxSelected>>", lambda e, cb=cb, pf=props_frame: self._on_master_selected(cb, pf))
+                cb.bind("<<ComboboxSelected>>",
+                        lambda e, cb=cb, pf=props_frame, le=entry_label: self._on_master_selected(cb, pf, le))
 
-                row_widgets.append({"combobox": cb, "props_frame": props_frame})
+                row_widgets.append({"combobox": cb, "props_frame": props_frame, "label_entry": entry_label})
             self.matrix_widgets.append(row_widgets)
 
         # update scroll region
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
-    def _on_master_selected(self, combobox, props_frame):
+    def _on_master_selected(self, combobox, props_frame, label_entry=None):
         # clear existing children
         for w in props_frame.winfo_children():
             w.destroy()
@@ -197,6 +202,12 @@ class SubstationApp:
         name = combobox.get()
         if not name or name == "None":
             return
+
+        if label_entry is not None:
+            current_text = label_entry.get().strip()
+            if not current_text:
+                label_entry.delete(0, tk.END)
+                label_entry.insert(0, name)
 
         props = self.masters_by_name.get(name, [])
         if not props:
@@ -233,7 +244,13 @@ class SubstationApp:
 
         matrix = []
         for row in self.matrix_widgets:
-            matrix.append([cell["combobox"].get() for cell in row])
+            row_data = []
+            for cell in row:
+                row_data.append({
+                    "name": cell["combobox"].get(),
+                    "label": cell["label_entry"].get().strip()
+                })
+            matrix.append(row_data)
 
         label_text = self.entry_substation_label.get().strip()
         data = {"central": central, "matrix_subs": matrix, "substation_label": label_text}
