@@ -47,84 +47,14 @@ class VisioEngine:
 
             masters_info = []
             for m in stencil.Masters:
-                # Name normalization
                 try:
                     name = self._normalize(m.Name)
                 except Exception:
                     name = self._normalize(getattr(m, "Name", "Unknown"))
 
-                props = []
-                # 1) Try direct Properties collection (if present)
-                try:
-                    if hasattr(m, "Properties"):
-                        for p in m.Properties:
-                            try:
-                                p_name = getattr(p, "Name", None) or getattr(p, "Label", None) or str(p)
-                                # Prefer ValueAsString if available
-                                p_val = ""
-                                try:
-                                    p_val = getattr(p, "ValueAsString", None)
-                                except Exception:
-                                    p_val = None
-                                if p_val is None:
-                                    try:
-                                        p_val = getattr(p, "Value", None)
-                                    except Exception:
-                                        p_val = None
-                                p_val = "" if p_val is None else str(p_val)
-                                props.append({"type": str(p_name), "value": p_val})
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
-
-                # 2) Fallback: Inspect first shape inside master and read Prop.Row_* cells
+                props = self._collect_master_properties(m)
                 if not props:
-                    try:
-                        # Some masters contain shapes collection
-                        if getattr(m, "Shapes", None):
-                            # iterate shapes in master
-                            for shp in m.Shapes:
-                                # Try up to 50 Prop rows heuristically
-                                for i in range(1, 51):
-                                    try:
-                                        # Try the common cell names
-                                        lbl_cell_name = f"Prop.Row_{i}.Label"
-                                        val_cell_name = f"Prop.Row_{i}.Value"
-                                        # If label exists, read it
-                                        if shp.CellExistsU(lbl_cell_name, 0):
-                                            try:
-                                                lbl = shp.CellsU(lbl_cell_name).ResultStr(0)
-                                            except Exception:
-                                                lbl = str(i)
-                                        elif shp.CellExistsU(f"Prop.Row_{i}", 0):
-                                            # fallback: use row existance
-                                            try:
-                                                lbl = shp.CellsU(f"Prop.Row_{i}.Label").ResultStr(0)
-                                            except Exception:
-                                                lbl = f"Row_{i}"
-                                        else:
-                                            # Not present; continue
-                                            continue
-
-                                        # value read
-                                        try:
-                                            val = shp.CellsU(val_cell_name).ResultStr(0)
-                                        except Exception:
-                                            # try ValueAsString style or generic cell
-                                            try:
-                                                val = shp.CellsU(f"Prop.Row_{i}.Value").ResultStr(0)
-                                            except Exception:
-                                                val = ""
-                                        props.append({"type": lbl, "value": val})
-                                    except Exception:
-                                        # row doesn't exist or access error, continue
-                                        continue
-                                # if we got props for this shape, stop checking other shapes
-                                if props:
-                                    break
-                    except Exception:
-                        pass
+                    props = self._legacy_prop_scrape(m)
 
                 masters_info.append({"name": name, "props": props})
 
@@ -281,10 +211,14 @@ class VisioEngine:
             return None
 
         bbox = self._get_shape_bbox(shp)
-        if label_text:
-            self._apply_label_to_shape(shp, label_text, bbox=bbox)
-
         self._try_ungroup(shp)
+
+        if label_text and bbox:
+            try:
+                self._place_label_for_shape(page, bbox, label_text)
+            except Exception:
+                pass
+
         return shp
 
     def _get_shape_bbox(self, shp):
@@ -294,6 +228,138 @@ class VisioEngine:
             return shp.BoundingBox(constants.visBBoxUpright)
         except Exception:
             return None
+
+    def _collect_master_properties(self, master):
+        props = []
+        try:
+            if hasattr(master, "Shapes"):
+                for shp in master.Shapes:
+                    props.extend(self._collect_props_from_shape(shp))
+        except Exception:
+            pass
+        return props
+
+    def _collect_props_from_shape(self, shape, parent_name=""):
+        results = []
+        try:
+            shape_name = self._normalize(getattr(shape, "Name", "")) or parent_name
+        except Exception:
+            shape_name = parent_name
+
+        results.extend(self._extract_prop_rows(shape, shape_name))
+
+        try:
+            if hasattr(shape, "Shapes"):
+                for child in shape.Shapes:
+                    results.extend(self._collect_props_from_shape(child, shape_name))
+        except Exception:
+            pass
+        return results
+
+    def _extract_prop_rows(self, shape, shape_name):
+        props = []
+        if shape is None:
+            return props
+
+        try:
+            if shape.SectionExists(constants.visSectionProp, 0):
+                row_count = shape.RowCount(constants.visSectionProp)
+                for idx in range(row_count):
+                    try:
+                        row_name = shape.RowNameU(constants.visSectionProp, idx)
+                    except Exception:
+                        row_name = f"Row_{idx}"
+
+                    label = ""
+                    value = ""
+                    try:
+                        label = shape.CellsU(f"Prop.{row_name}.Label").ResultStr(0)
+                    except Exception:
+                        try:
+                            label = shape.CellsU(f"Prop.{row_name}.Prompt").ResultStr(0)
+                        except Exception:
+                            label = row_name
+
+                    label = label or row_name
+
+                    try:
+                        value = shape.CellsU(f"Prop.{row_name}.Value").ResultStr(0)
+                    except Exception:
+                        try:
+                            value = shape.CellsU(f"Prop.{row_name}").ResultStr(0)
+                        except Exception:
+                            value = ""
+
+                    combined_label = f"{shape_name or 'Shape'} - {label}".strip(" -")
+                    props.append({"type": combined_label, "value": value})
+        except Exception:
+            pass
+
+        return props
+
+    def _legacy_prop_scrape(self, master):
+        props = []
+        try:
+            if hasattr(master, "Properties"):
+                for p in master.Properties:
+                    try:
+                        p_name = getattr(p, "Name", None) or getattr(p, "Label", None) or str(p)
+                        p_val = ""
+                        try:
+                            p_val = getattr(p, "ValueAsString", None)
+                        except Exception:
+                            p_val = None
+                        if p_val is None:
+                            try:
+                                p_val = getattr(p, "Value", None)
+                            except Exception:
+                                p_val = None
+                        p_val = "" if p_val is None else str(p_val)
+                        props.append({"type": str(p_name), "value": p_val})
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        if props:
+            return props
+
+        try:
+            if hasattr(master, "Shapes"):
+                for shp in master.Shapes:
+                    for i in range(1, 51):
+                        try:
+                            lbl_cell_name = f"Prop.Row_{i}.Label"
+                            val_cell_name = f"Prop.Row_{i}.Value"
+                            if shp.CellExistsU(lbl_cell_name, 0):
+                                try:
+                                    lbl = shp.CellsU(lbl_cell_name).ResultStr(0)
+                                except Exception:
+                                    lbl = str(i)
+                            elif shp.CellExistsU(f"Prop.Row_{i}", 0):
+                                try:
+                                    lbl = shp.CellsU(f"Prop.Row_{i}.Label").ResultStr(0)
+                                except Exception:
+                                    lbl = f"Row_{i}"
+                            else:
+                                continue
+
+                            try:
+                                val = shp.CellsU(val_cell_name).ResultStr(0)
+                            except Exception:
+                                try:
+                                    val = shp.CellsU(f"Prop.Row_{i}.Value").ResultStr(0)
+                                except Exception:
+                                    val = ""
+                            props.append({"type": lbl, "value": val})
+                        except Exception:
+                            continue
+                    if props:
+                        break
+        except Exception:
+            pass
+
+        return props
 
     def _try_ungroup(self, shp):
         try:
@@ -361,104 +427,66 @@ class VisioEngine:
             pass
         return None
 
-    def _apply_label_to_shape(self, shp, label_text, bbox=None):
-        if not shp or not label_text:
+    def _place_label_for_shape(self, page, bbox, label_text):
+        if not bbox:
             return
 
+        left, bottom, right, top = bbox
+        width = max(1.5, min(3.5, right - left))
+        height = 0.6
+        gap = 0.25
+
+        center_x = (left + right) / 2.0
+        rect_left = center_x - width / 2.0
+        rect_right = center_x + width / 2.0
+        rect_bottom = top + gap
+        rect_top = rect_bottom + height
+
+        t = page.DrawRectangle(rect_left, rect_top, rect_right, rect_bottom)
         try:
-            target = None
-            if hasattr(shp, "TextShape"):
-                try:
-                    target = shp.TextShape
-                except Exception:
-                    target = None
-            if target is None:
-                target = shp
-
-            chars = getattr(target, "Characters", None)
-            if chars is None:
-                return
-
-            try:
-                chars.Begin = 0
-                chars.End = chars.CharCount
-            except Exception:
-                pass
-
-            try:
-                target.Text = ""
-            except Exception:
-                pass
-
-            try:
-                chars.Begin = 0
-                chars.End = 0
-                chars.Insert(str(label_text))
-            except Exception:
-                return
-
-            self._format_label_text_block(target, bbox)
+            t.Text = label_text
         except Exception:
             pass
 
-    def _format_label_text_block(self, target, bbox=None):
-        if target is None:
-            return
         try:
-            target.CellsU("Char.Bold").FormulaU = "1"
+            t.CellsU("LinePattern").FormulaU = "0"
+        except Exception:
+            pass
+        try:
+            t.CellsU("FillPattern").FormulaU = "0"
+        except Exception:
+            pass
+        try:
+            t.CellsU("Char.Bold").FormulaU = "1"
         except Exception:
             try:
-                chars = target.Characters
+                chars = t.Characters
                 chars.set_CharProps(constants.visCharacterBold, 1)
             except Exception:
                 pass
+        try:
+            t.CellsU("Para.HorzAlign").FormulaU = "0"
+        except Exception:
+            pass
+        try:
+            t.CellsU("TextBlock.VerticalAlign").FormulaU = "2"
+        except Exception:
+            pass
+        try:
+            t.CellsU("TextBlock.MarginLeft").FormulaU = "0.05 in"
+        except Exception:
+            pass
+        try:
+            t.CellsU("TextBlock.MarginRight").FormulaU = "0.05 in"
+        except Exception:
+            pass
+        try:
+            t.CellsU("TextBlock.MarginTop").FormulaU = "0.02 in"
+        except Exception:
+            pass
 
         try:
-            target.CellsU("Para.HorzAlign").FormulaU = "0"
-        except Exception:
-            pass
-        try:
-            target.CellsU("TextBlock.VerticalAlign").FormulaU = "0"
-        except Exception:
-            pass
-        try:
-            target.CellsU("TextBlock.MarginLeft").FormulaU = "0.05 in"
-        except Exception:
-            pass
-        try:
-            target.CellsU("TextBlock.MarginTop").FormulaU = "0.05 in"
-        except Exception:
-            pass
-        try:
-            target.CellsU("TextBlock.MarginRight").FormulaU = "0.02 in"
+            t.BringToFront()
         except Exception:
             pass
 
-        if bbox:
-            left, bottom, right, top = bbox
-            width = max(0.5, right - left)
-            height = max(0.5, top - bottom)
-            try:
-                target.CellsU("TxtWidth").FormulaU = f"{width}"
-            except Exception:
-                pass
-            try:
-                target.CellsU("TxtHeight").FormulaU = f"{max(0.3, min(1.0, height * 0.4))}"
-            except Exception:
-                pass
-            try:
-                target.CellsU("TxtPinX").FormulaU = "Width*0"
-            except Exception:
-                pass
-            try:
-                target.CellsU("TxtPinY").FormulaU = "Height"
-            except Exception:
-                pass
-            try:
-                target.CellsU("TxtLocPinX").FormulaU = "TxtWidth*0"
-            except Exception:
-                pass
-            try:
-                target.CellsU("TxtLocPinY").FormulaU = "TxtHeight"
-            except Exception:
-                pass
