@@ -281,11 +281,8 @@ class VisioEngine:
             return None
 
         bbox = self._get_shape_bbox(shp)
-        if label_text and bbox:
-            try:
-                self._place_label_for_shape(page, None, label_text, bbox=bbox)
-            except Exception:
-                pass
+        if label_text:
+            self._apply_label_to_shape(shp, label_text, bbox=bbox)
 
         self._try_ungroup(shp)
         return shp
@@ -364,57 +361,104 @@ class VisioEngine:
             pass
         return None
 
-    # Helper to place small bold label at top-left of a given shape (best-effort)
-    def _place_label_for_shape(self, page, shp, label_text, bbox=None):
+    def _apply_label_to_shape(self, shp, label_text, bbox=None):
+        if not shp or not label_text:
+            return
+
         try:
-            # get bounding box: returns (Left, Bottom, Right, Top)
-            if bbox is None:
-                bbox = self._get_shape_bbox(shp)
-            if not bbox:
-                return
-            left = bbox[0]
-            bottom = bbox[1]
-            right = bbox[2]
-            top = bbox[3]
-            # small rectangle width/height for label (in inches)
-            w = max(1.2, min(2.5, (right - left) * 0.6))
-            h = 0.5
-
-            # place rectangle with top-left anchored inside the shape (slightly inset)
-            rect_left = left + 0.05
-            rect_top = top - 0.05
-            rect_right = rect_left + w
-            rect_bottom = rect_top - h
-
-            # create a small textbox rectangle; if it collides, it's OK — user can reposition in Visio
-            t = page.DrawRectangle(rect_left, rect_top, rect_right, rect_bottom)
-            # set text and style
-            try:
-                t.Text = label_text
-            except Exception:
-                pass
-            try:
-                t.CellsU("LinePattern").FormulaU = "0"
-            except Exception:
-                pass
-            try:
-                t.CellsU("FillPattern").FormulaU = "0"
-            except Exception:
-                pass
-            # try to set bold for characters
-            try:
-                t.CellsU("Char.Bold").FormulaU = "1"
-            except Exception:
+            target = None
+            if hasattr(shp, "TextShape"):
                 try:
-                    chars = t.Characters
-                    chars.set_CharProps(constants.visCharacterBold, 1)
+                    target = shp.TextShape
                 except Exception:
-                    pass
-            # try to put label above the shape (bring to front)
+                    target = None
+            if target is None:
+                target = shp
+
+            chars = getattr(target, "Characters", None)
+            if chars is None:
+                return
+
             try:
-                t.BringToFront()
+                chars.Begin = 0
+                chars.End = chars.CharCount
             except Exception:
                 pass
+
+            try:
+                target.Text = ""
+            except Exception:
+                pass
+
+            try:
+                chars.Begin = 0
+                chars.End = 0
+                chars.Insert(str(label_text))
+            except Exception:
+                return
+
+            self._format_label_text_block(target, bbox)
         except Exception:
-            # swallow label placement errors to avoid crashing layout generation
             pass
+
+    def _format_label_text_block(self, target, bbox=None):
+        if target is None:
+            return
+        try:
+            target.CellsU("Char.Bold").FormulaU = "1"
+        except Exception:
+            try:
+                chars = target.Characters
+                chars.set_CharProps(constants.visCharacterBold, 1)
+            except Exception:
+                pass
+
+        try:
+            target.CellsU("Para.HorzAlign").FormulaU = "0"
+        except Exception:
+            pass
+        try:
+            target.CellsU("TextBlock.VerticalAlign").FormulaU = "0"
+        except Exception:
+            pass
+        try:
+            target.CellsU("TextBlock.MarginLeft").FormulaU = "0.05 in"
+        except Exception:
+            pass
+        try:
+            target.CellsU("TextBlock.MarginTop").FormulaU = "0.05 in"
+        except Exception:
+            pass
+        try:
+            target.CellsU("TextBlock.MarginRight").FormulaU = "0.02 in"
+        except Exception:
+            pass
+
+        if bbox:
+            left, bottom, right, top = bbox
+            width = max(0.5, right - left)
+            height = max(0.5, top - bottom)
+            try:
+                target.CellsU("TxtWidth").FormulaU = f"{width}"
+            except Exception:
+                pass
+            try:
+                target.CellsU("TxtHeight").FormulaU = f"{max(0.3, min(1.0, height * 0.4))}"
+            except Exception:
+                pass
+            try:
+                target.CellsU("TxtPinX").FormulaU = "Width*0"
+            except Exception:
+                pass
+            try:
+                target.CellsU("TxtPinY").FormulaU = "Height"
+            except Exception:
+                pass
+            try:
+                target.CellsU("TxtLocPinX").FormulaU = "TxtWidth*0"
+            except Exception:
+                pass
+            try:
+                target.CellsU("TxtLocPinY").FormulaU = "TxtHeight"
+            except Exception:
+                pass

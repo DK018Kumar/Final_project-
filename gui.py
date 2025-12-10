@@ -36,6 +36,7 @@ class SubstationApp:
         tk.Label(top, text="Central Substation:").grid(row=1, column=0, sticky="w", pady=8)
         self.cb_central = ttk.Combobox(top, state="readonly", width=60)
         self.cb_central.grid(row=1, column=1, sticky="w", padx=6)
+        self.cb_central.bind("<<ComboboxSelected>>", self._on_central_selected)
 
         tk.Label(top, text="Central Label:").grid(row=2, column=0, sticky="w")
         self.entry_central_label = tk.Entry(top, width=40)
@@ -54,6 +55,15 @@ class SubstationApp:
         tk.Button(top, text="Build Matrix", command=self.build_matrix).grid(row=3, column=2, padx=10)
         tk.Button(top, text="Generate Visio Layout", bg="green", fg="white", command=self.on_generate) \
             .grid(row=4, column=0, columnspan=3, pady=12, sticky="ew")
+
+        # Shape data preview block
+        preview_frame = tk.LabelFrame(self.root, text="Shape Data Preview", padx=10, pady=6)
+        preview_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self.shape_data_text = tk.Text(preview_frame, height=8, wrap="none", state="disabled")
+        self.shape_data_text.pack(side="left", fill="both", expand=True)
+        preview_scroll = tk.Scrollbar(preview_frame, orient="vertical", command=self.shape_data_text.yview)
+        preview_scroll.pack(side="right", fill="y")
+        self.shape_data_text.configure(yscrollcommand=preview_scroll.set)
 
         # Scrollable area for matrix
         container = tk.Frame(self.root)
@@ -140,7 +150,10 @@ class SubstationApp:
         self.cb_central["values"] = names
         if names:
             self.cb_central.current(0)
+            self._update_shape_data_display(names[0])
         messagebox.showinfo("Success", f"Loaded {len(names)} masters.")
+        if not names:
+            self._update_shape_data_display("")
 
     # ------------------------
     # Build matrix UI
@@ -210,6 +223,7 @@ class SubstationApp:
                 label_entry.insert(0, name)
 
         props = self.masters_by_name.get(name, [])
+        self._update_shape_data_display(name)
         if not props:
             tk.Label(props_frame, text="(no shape data found)", fg="gray").pack(anchor="w")
             return
@@ -261,6 +275,31 @@ class SubstationApp:
             "substation_label": central_label
         }
         threading.Thread(target=self._thread_generate, args=(data,), daemon=True).start()
+
+    def _on_central_selected(self, event=None):
+        name = self.cb_central.get()
+        if name:
+            self._update_shape_data_display(name)
+
+    def _update_shape_data_display(self, name):
+        if not hasattr(self, "shape_data_text") or self.shape_data_text is None:
+            return
+        props = self.masters_by_name.get(name, [])
+
+        lines = [f"Master: {name or '(none)'}", "-" * 40]
+        if props:
+            for prop in props:
+                t = prop.get("type", "")
+                v = prop.get("value", "")
+                lines.append(f"{t or '(unnamed)'}: {v}")
+        else:
+            lines.append("(no shape data)")
+
+        text_value = "\n".join(lines)
+        self.shape_data_text.configure(state="normal")
+        self.shape_data_text.delete("1.0", tk.END)
+        self.shape_data_text.insert(tk.END, text_value)
+        self.shape_data_text.configure(state="disabled")
 
     def _thread_generate(self, data):
         try:
