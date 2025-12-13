@@ -52,6 +52,114 @@ class VisioEngine:
         return " ".join(name.strip().split()) if name else ""
 
     # ----------------------------------------------------------
+    # ShapeSheet Shape Data helpers (Prop section ONLY)
+    # ----------------------------------------------------------
+    def _cell_result_str(self, shp, cell_name):
+        # Return evaluated cell text, best-effort.
+        try:
+            return shp.CellsU(cell_name).ResultStr("")
+        except Exception:
+            try:
+                return shp.CellsU(cell_name).ResultStr(0)
+            except Exception:
+                return None
+
+    def get_type_value(self, shp):
+        """
+        Returns the evaluated text from ShapeSheet:
+          Prop.TYPE.Value
+        Trimmed; returns None if missing/empty.
+        """
+        if shp is None:
+            return None
+        v = self._cell_result_str(shp, "Prop.TYPE.Value")
+        if v is None:
+            return None
+        v = str(v).strip()
+        return v or None
+
+    def get_shape_data(self, shp):
+        """
+        Iterate visSectionProp and return an insertion-ordered dict:
+          { row_name: {"label":..., "type":..., "format":..., "value":...}, ... }
+        Uses ShapeSheet evaluated text for Value (ResultStr("")).
+        Skips gracefully if Prop section is missing.
+        """
+        data = {}
+        if shp is None:
+            return data
+        try:
+            if not shp.SectionExists(constants.visSectionProp, 0):
+                return data
+        except Exception:
+            return data
+
+        try:
+            row_count = int(shp.RowCount(constants.visSectionProp))
+        except Exception:
+            row_count = 0
+
+        for idx in range(row_count):
+            try:
+                row_name = shp.RowNameU(constants.visSectionProp, idx)
+            except Exception:
+                row_name = f"Row_{idx}"
+
+            value = self._cell_result_str(shp, f"Prop.{row_name}.Value")
+            if value is None:
+                value = self._cell_result_str(shp, f"Prop.{row_name}")
+            label = self._cell_result_str(shp, f"Prop.{row_name}.Label")
+            ptype = self._cell_result_str(shp, f"Prop.{row_name}.Type")
+            pformat = self._cell_result_str(shp, f"Prop.{row_name}.Format")
+
+            data[row_name] = {
+                "label": "" if label is None else str(label).strip(),
+                "type": "" if ptype is None else str(ptype).strip(),
+                "format": "" if pformat is None else str(pformat).strip(),
+                "value": "" if value is None else str(value).strip(),
+            }
+
+        return data
+
+    def find_shapes_by_type(self, page, wanted_type: str):
+        """
+        Find all shapes on the page (including within groups) where
+        get_type_value(shape) matches wanted_type (case-insensitive).
+        """
+        if page is None:
+            return []
+        wanted = (wanted_type or "").strip().lower()
+        if not wanted:
+            return []
+
+        found = []
+
+        def _walk(shp):
+            if shp is None:
+                return
+            try:
+                t = self.get_type_value(shp)
+                if t is not None and t.strip().lower() == wanted:
+                    found.append(shp)
+            except Exception:
+                pass
+
+            try:
+                if hasattr(shp, "Shapes"):
+                    for child in shp.Shapes:
+                        _walk(child)
+            except Exception:
+                pass
+
+        try:
+            for shp in page.Shapes:
+                _walk(shp)
+        except Exception:
+            pass
+
+        return found
+
+    # ----------------------------------------------------------
     # Load stencil + extract master names + shape data (best-effort)
     # Backward compatible return:
     # - 'name': master name
@@ -137,67 +245,13 @@ class VisioEngine:
         finally:
             pythoncom.CoUninitialize()
 
-    # ----------------------------------------------------------
-    # Read ShapeSheet "Shape Data" only (Prop section) from a shape.
-    # Returns list of dicts: {"label": <str>, "value": <str>}
-    # ----------------------------------------------------------
+    # Backward-compat helper used by older code paths:
+    # returns list[{"label","value"}] derived from get_shape_data()
     def get_shape_sheet_shape_data(self, shape):
-        rows = []
-        if shape is None:
-            return rows
-        try:
-            if not shape.SectionExists(constants.visSectionProp, 0):
-                return rows
-        except Exception:
-            return rows
-
-        try:
-            row_count = shape.RowCount(constants.visSectionProp)
-        except Exception:
-            row_count = 0
-
-        for idx in range(int(row_count or 0)):
-            try:
-                row_name = shape.RowNameU(constants.visSectionProp, idx)
-            except Exception:
-                row_name = f"Row_{idx}"
-
-            label = ""
-            value = ""
-
-            try:
-                label = shape.CellsU(f"Prop.{row_name}.Label").ResultStr(0)
-            except Exception:
-                try:
-                    label = shape.CellsU(f"Prop.{row_name}.Prompt").ResultStr(0)
-                except Exception:
-                    label = row_name
-
-            label = (label or row_name or "").strip()
-
-            try:
-                value = shape.CellsU(f"Prop.{row_name}.Value").ResultStr(0)
-            except Exception:
-                try:
-                    value = shape.CellsU(f"Prop.{row_name}").ResultStr(0)
-                except Exception:
-                    value = ""
-
-            rows.append({"label": label, "value": "" if value is None else str(value)})
-
-        # remove empty labels
         out = []
-        seen = set()
-        for r in rows:
-            lbl = (r.get("label") or "").strip()
-            val = (r.get("value") or "").strip()
-            if not lbl:
-                continue
-            key = (lbl, val)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({"label": lbl, "value": val})
+        sd = self.get_shape_data(shape)
+        for _row_name, row in sd.items():
+            out.append({"label": row.get("label", ""), "value": row.get("value", "")})
         return out
 
     # ----------------------------------------------------------
@@ -576,6 +630,49 @@ class VisioEngine:
                     stencil.Close()
                 except Exception:
                     pass
+
+            # Return new shape info so UI can refresh
+            try:
+                return {
+                    "page_id": int(getattr(page, "ID", 0)),
+                    "shape_id": int(getattr(new_shape, "ID", 0)),
+                    "type_value": self.get_type_value(new_shape),
+                    "shape_data": self.get_shape_data(new_shape),
+                }
+            except Exception:
+                return None
+        finally:
+            pythoncom.CoUninitialize()
+
+    def delete_shape_by_id(self, page_id, shape_id):
+        pythoncom.CoInitialize()
+        try:
+            app, _docs = self._get_visio()
+            doc = getattr(app, "ActiveDocument", None)
+            if doc is None:
+                raise Exception("No active Visio document.")
+
+            page = None
+            try:
+                page = doc.Pages.ItemFromID(int(page_id))
+            except Exception:
+                page = None
+            if page is None:
+                raise Exception("Could not find page.")
+
+            shp = None
+            try:
+                shp = page.Shapes.ItemFromID(int(shape_id))
+            except Exception:
+                shp = None
+            if shp is None:
+                raise Exception("Could not find shape.")
+
+            try:
+                shp.Delete()
+            except Exception as e:
+                raise Exception(f"Delete failed: {e}") from e
+            return True
         finally:
             pythoncom.CoUninitialize()
 
@@ -657,9 +754,8 @@ class VisioEngine:
                     layout_meta["central"] = {
                         "shape_id": int(getattr(central_shape, "ID", 0)),
                         "page_id": int(getattr(page, "ID", 0)),
-                        "master": central_name,
-                        "label": label_text,
-                        "shape_data": self.get_shape_sheet_shape_data(central_shape),
+                        "type_value": self.get_type_value(central_shape),
+                        "shape_data": self.get_shape_data(central_shape),
                     }
                 except Exception:
                     layout_meta["central"] = None
@@ -734,9 +830,8 @@ class VisioEngine:
                             {
                                 "shape_id": int(getattr(shp, "ID", 0)),
                                 "page_id": int(getattr(page, "ID", 0)),
-                                "master": cell_name,
-                                "label": label,
-                                "shape_data": self.get_shape_sheet_shape_data(shp),
+                            "type_value": self.get_type_value(shp),
+                            "shape_data": self.get_shape_data(shp),
                             }
                         )
                     except Exception:

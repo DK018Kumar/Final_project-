@@ -365,10 +365,8 @@ class SubstationApp:
         for w in pf.winfo_children():
             w.destroy()
 
-        title_text = "ShapeSheet Shape Data"
-        if show_replace_button:
-            title_text += " (click Replace to swap this shape)"
-        title = tk.Label(pf, text=title_text, font=("Arial", 9, "bold"))
+        # Display Shape Data ONLY (Label/Value) and actions for dropped shapes
+        title = tk.Label(pf, text="Shape Data", font=("Arial", 9, "bold"))
         title.pack(anchor="w")
 
         def _select_target(_event=None):
@@ -377,9 +375,10 @@ class SubstationApp:
         if show_replace_button:
             title.bind("<Button-1>", _select_target)
 
-        if show_replace_button:
-            btn = tk.Button(pf, text="Replace…", command=lambda: self._replace_via_dialog(cell_state))
-            btn.pack(anchor="w", pady=(4, 4))
+            actions = tk.Frame(pf)
+            actions.pack(anchor="w", pady=(4, 4))
+            tk.Button(actions, text="Replace…", command=lambda: self._replace_via_dialog(cell_state)).pack(side="left")
+            tk.Button(actions, text="Delete", command=lambda: self._delete_shape(cell_state)).pack(side="left", padx=(8, 0))
 
         if not shape_data_rows:
             lbl = tk.Label(pf, text="(no ShapeSheet Shape Data rows found)", fg="gray")
@@ -391,7 +390,13 @@ class SubstationApp:
         tk.Label(header, text="Label", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
         tk.Label(header, text="Value", font=("Arial", 9, "bold")).grid(row=0, column=1, sticky="w")
 
-        for r in shape_data_rows:
+        # shape_data_rows can be list[{"label","value"}] or dict[row_name]->{...}
+        if isinstance(shape_data_rows, dict):
+            iterable = list(shape_data_rows.values())
+        else:
+            iterable = shape_data_rows
+
+        for r in iterable:
             lbl = (r.get("label") or "").strip()
             val = (r.get("value") or "").strip()
             row = tk.Frame(pf)
@@ -404,6 +409,36 @@ class SubstationApp:
             if show_replace_button:
                 for w in (row, l1, l2):
                     w.bind("<Button-1>", _select_target)
+
+    def _delete_shape(self, cell_state):
+        page_id = cell_state.get("visio_page_id")
+        shape_id = cell_state.get("visio_shape_id")
+        if not page_id or not shape_id:
+            messagebox.showwarning("Not generated", "Generate the Visio layout first, then you can delete shapes.")
+            return
+
+        if not messagebox.askyesno("Confirm delete", "Delete this shape from Visio?"):
+            return
+
+        def _run():
+            try:
+                self.engine.delete_shape_by_id(page_id, shape_id)
+
+                def _after():
+                    cell_state["visio_page_id"] = None
+                    cell_state["visio_shape_id"] = None
+                    pf = cell_state["props_frame"]
+                    for w in pf.winfo_children():
+                        w.destroy()
+                    tk.Label(pf, text="(deleted)", fg="gray").pack(anchor="w")
+                    messagebox.showinfo("Deleted", "Shape deleted.")
+
+                self.root.after(0, _after)
+            except Exception:
+                tb = traceback.format_exc()
+                self.root.after(0, lambda: messagebox.showerror("Error", tb))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _thread_generate(self, data):
         try:
@@ -511,14 +546,27 @@ class SubstationApp:
                     return
 
                 label = (cell_state.get("label_entry").get() or "").strip() if cell_state.get("label_entry") else ""
-                self.engine.replace_shape_by_id(
+                result = self.engine.replace_shape_by_id(
                     page_id=page_id,
                     shape_id=shape_id,
                     stencil_path=stencil_path,
                     replacement_master_name=chosen,
                     label_text=label or None,
                 )
-                self.root.after(0, lambda: messagebox.showinfo("Success", "Shape replaced."))
+                def _after():
+                    if isinstance(result, dict):
+                        cell_state["visio_page_id"] = result.get("page_id")
+                        cell_state["visio_shape_id"] = result.get("shape_id")
+                        self._render_cell_shape_data(
+                            cell_state,
+                            row_idx=None,
+                            col_idx=None,
+                            shape_data_rows=result.get("shape_data", {}),
+                            show_replace_button=True,
+                        )
+                    messagebox.showinfo("Success", "Shape replaced.")
+
+                self.root.after(0, _after)
             except Exception as e:
                 tb = traceback.format_exc()
                 try:
