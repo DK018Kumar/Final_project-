@@ -154,7 +154,13 @@ class SubstationApp:
             masters = self.engine.load_stencil_masters(path)
             self.root.after(0, lambda: self._after_load_stencil(masters))
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+            tb = traceback.format_exc()
+            # Ensure the real COM/Visio error is visible
+            try:
+                print(tb, file=sys.stderr)
+            except Exception:
+                pass
+            self.root.after(0, lambda: messagebox.showerror("Error", tb))
 
     def _after_load_stencil(self, masters):
         # masters: list of dicts {'name':..., 'shape_data': [...]}
@@ -514,7 +520,12 @@ class SubstationApp:
                 )
                 self.root.after(0, lambda: messagebox.showinfo("Success", "Shape replaced."))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                tb = traceback.format_exc()
+                try:
+                    print(tb, file=sys.stderr)
+                except Exception:
+                    pass
+                self.root.after(0, lambda: messagebox.showerror("Error", tb))
 
         threading.Thread(target=_run, daemon=True).start()
 
