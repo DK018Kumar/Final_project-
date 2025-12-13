@@ -30,7 +30,7 @@ class VisioEngine:
 
     # ----------------------------------------------------------
     # Load stencil + extract master names + shape data (best-effort)
-    # Returns list of dicts: {'name': <str>, 'props': [{'type':..., 'value':...}, ...]}
+    # Returns list of dicts: {'name': <str>, 'shape_data': [{'label':..., 'value':...}, ...]}
     # ----------------------------------------------------------
     def load_stencil_masters(self, stencil_path):
         pythoncom.CoInitialize()
@@ -58,26 +58,31 @@ class VisioEngine:
                 except Exception:
                     name = self._normalize(getattr(m, "Name", "Unknown"))
 
-                props = []
-                # Primary: drop and scrape the resulting shape tree
+                shape_data = []
+                # Primary: drop and read ShapeSheet "Shape Data" (Prop) rows
                 try:
                     dropped = tmp_page.Drop(m, 0, 0)
-                    props = self._collect_shape_properties_from_instance(dropped)
+                    shape_data = self.get_shape_sheet_shape_data(dropped)
                     # Clean up the temporary drop to keep the page light
                     try:
                         dropped.Delete()
                     except Exception:
                         pass
                 except Exception:
-                    props = []
+                    shape_data = []
 
-                # Fallbacks
-                if not props:
-                    props = self._collect_master_properties(m)
-                if not props:
-                    props = self._legacy_prop_scrape(m)
+                # Fallbacks: try to recover any Prop rows if drop-based failed
+                # (best-effort; still returns label/value pairs)
+                if not shape_data:
+                    try:
+                        # attempt to scrape from master shapes by reusing Prop extraction
+                        props = self._collect_master_properties(m)
+                        # map to label/value-ish strings
+                        shape_data = [{"label": p.get("type", ""), "value": p.get("value", "")} for p in (props or [])]
+                    except Exception:
+                        shape_data = []
 
-                masters_info.append({"name": name, "props": props})
+                masters_info.append({"name": name, "shape_data": shape_data})
 
             try:
                 tmp_doc.Close(False)

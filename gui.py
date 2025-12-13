@@ -2,8 +2,8 @@ import sys
 import threading
 import traceback
 import tkinter as tk
+import time
 from tkinter import filedialog, messagebox, ttk
-import copy
 
 import visio_engine
 
@@ -21,10 +21,8 @@ class SubstationApp:
         self.masters_by_name = {}
         # matrix structure holds rows of dicts {'combobox':..., 'props_frame':...}
         self.matrix_widgets = []
-        self.live_visio_preview_enabled = tk.BooleanVar(value=True)
-        self._selected_visio_shape_id = None
-        self._selected_visio_page_id = None
         self._replace_target = None  # {"page_id":..., "shape_id":..., "row":..., "col":..., "kind":...}
+        self._central_visio = None  # {"page_id":..., "shape_id":...} set after generation
 
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -63,39 +61,15 @@ class SubstationApp:
         tk.Button(top, text="Generate Visio Layout", bg="green", fg="white", command=self.on_generate).grid(
             row=4, column=0, columnspan=3, pady=12, sticky="ew"
         )
-        tk.Checkbutton(
-            top,
-            text="Live Visio Selection Preview",
-            variable=self.live_visio_preview_enabled,
-            onvalue=True,
-            offvalue=False,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
-        # Replace selected shape controls (from ANY stencil file on disk)
-        replace_frame = tk.LabelFrame(
-            top,
-            text="Replace target: click a substation's Shape Data panel, then replace",
-            padx=8,
-            pady=6,
-        )
-        replace_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-
-        tk.Label(replace_frame, text="Stencil file:").grid(row=0, column=0, sticky="w")
-        self.entry_replace_stencil = tk.Entry(replace_frame, width=52)
-        self.entry_replace_stencil.grid(row=0, column=1, sticky="w", padx=(6, 6))
-        tk.Button(replace_frame, text="Browse…", command=self.on_browse_replace_stencil).grid(row=0, column=2, sticky="w")
-
-        tk.Label(replace_frame, text="New Master:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.cb_replace_master = ttk.Combobox(replace_frame, state="readonly", width=50)
-        self.cb_replace_master.grid(row=1, column=1, sticky="w", padx=(6, 10), pady=(6, 0))
-
-        tk.Label(replace_frame, text="Label (optional):").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        self.entry_replace_label = tk.Entry(replace_frame, width=52)
-        self.entry_replace_label.grid(row=2, column=1, sticky="w", padx=(6, 10), pady=(6, 0))
-
-        tk.Button(replace_frame, text="Replace Target", command=self.on_replace_selected).grid(
-            row=1, column=2, rowspan=2, padx=(6, 0), sticky="ns"
-        )
+        # Central Shape Data (from ShapeSheet Prop rows of the master)
+        central_sd = tk.LabelFrame(self.root, text="Central Shape Data (ShapeSheet)", padx=10, pady=6)
+        central_sd.pack(fill="x", padx=10, pady=(0, 6))
+        self.central_sd_text = tk.Text(central_sd, height=6, wrap="none", state="disabled")
+        self.central_sd_text.pack(side="left", fill="both", expand=True)
+        central_sd_scroll = tk.Scrollbar(central_sd, orient="vertical", command=self.central_sd_text.yview)
+        central_sd_scroll.pack(side="right", fill="y")
+        self.central_sd_text.configure(yscrollcommand=central_sd_scroll.set)
 
         # Scrollable area for matrix
         container = tk.Frame(self.root)
@@ -174,16 +148,18 @@ class SubstationApp:
             self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
 
     def _after_load_stencil(self, masters):
-        # masters: list of dicts {'name':..., 'props': [...]}
+        # masters: list of dicts {'name':..., 'shape_data': [...]}
         self.loaded_masters = masters
-        self.masters_by_name = {m["name"]: m.get("props", []) for m in masters}
+        # master_name -> list of {"label":..., "value":...}
+        self.masters_by_name = {m["name"]: m.get("shape_data", []) for m in masters}
         names = list(self.masters_by_name.keys())
         self.lbl_stencil.config(text="Stencil Loaded", fg="black")
         self.cb_central["values"] = names
         if names:
             self.cb_central.current(0)
+            self._render_central_shape_data(names[0])
         messagebox.showinfo("Success", f"Loaded {len(names)} masters.")
-        # Shape Data for each substation is shown inside each matrix cell after generation.
+        # Matrix cell Shape Data is shown per-cell, based on selected master and/or generated shape.
 
     # ------------------------
     # Build matrix UI
@@ -269,11 +245,11 @@ class SubstationApp:
                 label_entry.delete(0, tk.END)
                 label_entry.insert(0, name)
 
-        # Do NOT show cached/stencil-internal data here.
-        # The user-facing Shape Data must come from the generated Visio shape's ShapeSheet (Prop rows).
         cell_state["selected_master"] = name
         cell_state["selected_props"] = []
-        tk.Label(props_frame, text="(generate layout to see this shape's ShapeSheet data)", fg="gray").pack(anchor="w")
+
+        # Show ShapeSheet Shape Data for the *master* (drop-to-temp is done in engine load)
+        self._render_cell_shape_data(cell_state, row_idx=None, col_idx=None, shape_data_rows=self.masters_by_name.get(name, []), show_replace_button=False)
 
     # ------------------------
     # Generate layout in Visio
@@ -307,9 +283,24 @@ class SubstationApp:
 
     def _on_central_selected(self, event=None):
         name = self.cb_central.get()
-        # Shape Data for the generated central shape is shown in Visio (label above shape).
-        # Per-substation Shape Data panels are rendered in the matrix after generation.
-        _ = name
+        if name:
+            self._render_central_shape_data(name)
+
+    def _render_central_shape_data(self, master_name):
+        rows = self.masters_by_name.get(master_name, [])
+        lines = [f"Master: {master_name}", "-" * 40]
+        for r in rows:
+            lbl = (r.get("label") or "").strip()
+            val = (r.get("value") or "").strip()
+            if lbl:
+                lines.append(f"{lbl}: {val}")
+        if len(lines) == 2:
+            lines.append("(no Shape Data)")
+        text_value = "\n".join(lines)
+        self.central_sd_text.configure(state="normal")
+        self.central_sd_text.delete("1.0", tk.END)
+        self.central_sd_text.insert(tk.END, text_value)
+        self.central_sd_text.configure(state="disabled")
 
     def _set_replace_target(self, cell_state, row_idx=None, col_idx=None):
         page_id = cell_state.get("visio_page_id")
@@ -324,26 +315,30 @@ class SubstationApp:
             "kind": "matrix_cell",
         }
 
-    def _render_cell_shape_data(self, cell_state, row_idx, col_idx, shape_data_rows):
+    def _render_cell_shape_data(self, cell_state, row_idx, col_idx, shape_data_rows, show_replace_button):
         pf = cell_state["props_frame"]
         for w in pf.winfo_children():
             w.destroy()
 
-        # Title line (clickable)
-        title = tk.Label(pf, text="Shape Data (click to target replace)", font=("Arial", 9, "bold"))
+        title_text = "ShapeSheet Shape Data"
+        if show_replace_button:
+            title_text += " (click Replace to swap this shape)"
+        title = tk.Label(pf, text=title_text, font=("Arial", 9, "bold"))
         title.pack(anchor="w")
 
         def _select_target(_event=None):
             self._set_replace_target(cell_state, row_idx=row_idx, col_idx=col_idx)
 
-        title.bind("<Button-1>", _select_target)
-        title.bind("<Double-1>", lambda e: self.on_replace_selected())
+        if show_replace_button:
+            title.bind("<Button-1>", _select_target)
+
+        if show_replace_button:
+            btn = tk.Button(pf, text="Replace…", command=lambda: self._replace_via_dialog(cell_state))
+            btn.pack(anchor="w", pady=(4, 4))
 
         if not shape_data_rows:
             lbl = tk.Label(pf, text="(no ShapeSheet Shape Data rows found)", fg="gray")
             lbl.pack(anchor="w")
-            lbl.bind("<Button-1>", _select_target)
-            lbl.bind("<Double-1>", lambda e: self.on_replace_selected())
             return
 
         header = tk.Frame(pf)
@@ -361,9 +356,9 @@ class SubstationApp:
             l2 = tk.Label(row, text=val, anchor="w", wraplength=280, justify="left")
             l2.grid(row=0, column=1, sticky="w")
 
-            for w in (row, l1, l2):
-                w.bind("<Button-1>", _select_target)
-                w.bind("<Double-1>", lambda e: self.on_replace_selected())
+            if show_replace_button:
+                for w in (row, l1, l2):
+                    w.bind("<Button-1>", _select_target)
 
     def _thread_generate(self, data):
         try:
@@ -383,6 +378,9 @@ class SubstationApp:
 
     def _apply_layout_meta(self, meta):
         matrix = (meta or {}).get("matrix", [])
+        central = (meta or {}).get("central")
+        if isinstance(central, dict):
+            self._central_visio = {"page_id": central.get("page_id"), "shape_id": central.get("shape_id")}
         for r, row in enumerate(self.matrix_widgets):
             for c, cell_state in enumerate(row):
                 info = None
@@ -394,7 +392,8 @@ class SubstationApp:
                 if info and isinstance(info, dict):
                     cell_state["visio_shape_id"] = info.get("shape_id")
                     cell_state["visio_page_id"] = info.get("page_id")
-                    self._render_cell_shape_data(cell_state, r, c, info.get("shape_data", []))
+                    # show ShapeSheet data for the actual dropped shape and enable Replace button
+                    self._render_cell_shape_data(cell_state, r, c, info.get("shape_data", []), show_replace_button=True)
                 else:
                     cell_state["visio_shape_id"] = None
                     cell_state["visio_page_id"] = None
@@ -403,58 +402,75 @@ class SubstationApp:
                         w.destroy()
                     tk.Label(pf, text="(empty)", fg="gray").pack(anchor="w")
 
-    def on_browse_replace_stencil(self):
-        path = filedialog.askopenfilename(filetypes=[("Visio Stencil", "*.vssx *.vss *.vstx")])
-        if not path:
-            return
-        self.entry_replace_stencil.delete(0, tk.END)
-        self.entry_replace_stencil.insert(0, path)
-
-        def _load():
-            try:
-                names = self.engine.get_stencil_master_names(path)
-                self.root.after(0, lambda: self._set_replace_master_names(names))
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
-
-        threading.Thread(target=_load, daemon=True).start()
-
-    def _set_replace_master_names(self, names):
-        self.cb_replace_master["values"] = names
-        if names:
-            self.cb_replace_master.current(0)
-
-    def on_replace_selected(self):
-        # Replace the shape whose per-cell Shape Data panel you clicked
-        if not self._replace_target:
-            messagebox.showwarning("Select target", "Click a substation's Shape Data panel first to select the target.")
-            return
-
-        page_id = self._replace_target.get("page_id")
-        shape_id = self._replace_target.get("shape_id")
+    def _replace_via_dialog(self, cell_state):
+        # Must have a generated Visio shape to replace
+        page_id = cell_state.get("visio_page_id")
+        shape_id = cell_state.get("visio_shape_id")
         if not page_id or not shape_id:
-            messagebox.showwarning("Select target", "Target is missing Visio IDs. Generate the layout again.")
+            messagebox.showwarning("Not generated", "Generate the Visio layout first, then you can replace shapes.")
             return
 
-        stencil_path = (self.entry_replace_stencil.get() or "").strip()
+        stencil_path = filedialog.askopenfilename(filetypes=[("Visio Stencil", "*.vssx *.vss *.vstx")])
         if not stencil_path:
-            messagebox.showwarning("Select stencil", "Browse and select the replacement stencil file first.")
             return
-
-        master = (self.cb_replace_master.get() or "").strip()
-        if not master:
-            messagebox.showwarning("Select master", "Choose a replacement master from the selected stencil.")
-            return
-
-        label = (self.entry_replace_label.get() or "").strip()
 
         def _run():
             try:
+                masters = self.engine.get_stencil_master_names(stencil_path)
+                if not masters:
+                    raise Exception("No masters found in selected stencil.")
+
+                # If only one master, use it automatically. Otherwise ask user.
+                if len(masters) == 1:
+                    chosen = masters[0]
+                else:
+                    chosen = None
+
+                    def _ask():
+                        dlg = tk.Toplevel(self.root)
+                        dlg.title("Choose replacement master")
+                        tk.Label(dlg, text="Select master to replace with:").pack(anchor="w", padx=10, pady=(10, 4))
+                        cb = ttk.Combobox(dlg, state="readonly", values=masters, width=60)
+                        cb.pack(padx=10, pady=(0, 10))
+                        cb.current(0)
+
+                        result = {"val": None}
+
+                        def _ok():
+                            result["val"] = cb.get()
+                            dlg.destroy()
+
+                        tk.Button(dlg, text="OK", command=_ok).pack(pady=(0, 10))
+                        dlg.transient(self.root)
+                        dlg.grab_set()
+                        self.root.wait_window(dlg)
+                        return result["val"]
+
+                    chosen = self.root.after(0, lambda: None)  # placeholder
+                    # marshal dialog to main thread
+                    chosen_holder = {"val": None}
+
+                    def _run_dialog():
+                        chosen_holder["val"] = _ask()
+
+                    self.root.after(0, _run_dialog)
+                    # wait a bit for dialog completion (best-effort)
+                    # We can't block Tk thread here; just poll.
+                    for _ in range(600):
+                        if chosen_holder["val"] is not None:
+                            break
+                        time.sleep(0.05)
+                    chosen = chosen_holder["val"]
+
+                if not chosen:
+                    return
+
+                label = (cell_state.get("label_entry").get() or "").strip() if cell_state.get("label_entry") else ""
                 self.engine.replace_shape_by_id(
                     page_id=page_id,
                     shape_id=shape_id,
                     stencil_path=stencil_path,
-                    replacement_master_name=master,
+                    replacement_master_name=chosen,
                     label_text=label or None,
                 )
                 self.root.after(0, lambda: messagebox.showinfo("Success", "Shape replaced."))
