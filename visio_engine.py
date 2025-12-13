@@ -141,15 +141,26 @@ class VisioEngine:
 
                             title = engine._format_shape_title(shp)
                             props = engine._collect_shape_properties_from_instance(shp)
+                            shape_id = None
+                            page_id = None
+                            try:
+                                shape_id = int(getattr(shp, "ID", 0))
+                            except Exception:
+                                shape_id = None
+                            try:
+                                pg = getattr(shp, "ContainingPage", None)
+                                page_id = int(getattr(pg, "ID", 0)) if pg is not None else None
+                            except Exception:
+                                page_id = None
 
                             # Avoid spamming callback with identical payloads
-                            sig = (title, len(props))
+                            sig = (title, len(props), shape_id, page_id)
                             if sig == self._last_sig:
                                 return
                             self._last_sig = sig
 
                             try:
-                                callback({"title": title, "props": props})
+                                callback({"title": title, "props": props, "shape_id": shape_id, "page_id": page_id})
                             except Exception:
                                 return
                         except Exception:
@@ -179,6 +190,50 @@ class VisioEngine:
                 pass
         self._selection_stop = None
         self._selection_thread = None
+
+    # ----------------------------------------------------------
+    # List master names from an arbitrary stencil file (does not
+    # change self.current_stencil_path).
+    # ----------------------------------------------------------
+    def get_stencil_master_names(self, stencil_path):
+        pythoncom.CoInitialize()
+        try:
+            if not stencil_path or not os.path.exists(stencil_path):
+                raise Exception("Stencil not found.")
+
+            app, docs = self._get_visio()
+
+            base = os.path.basename(stencil_path)
+            temp_copy = os.path.join(tempfile.gettempdir(), f"pick_{int(time.time() * 1000)}_{base}")
+            shutil.copy2(stencil_path, temp_copy)
+
+            stencil = docs.OpenEx(temp_copy, 64)
+            try:
+                names = []
+                for m in stencil.Masters:
+                    try:
+                        nm = self._normalize(getattr(m, "Name", "")) or self._normalize(getattr(m, "NameU", ""))
+                    except Exception:
+                        nm = ""
+                    if nm:
+                        names.append(nm)
+
+                # Dedup preserve order
+                seen = set()
+                out = []
+                for n in names:
+                    if n in seen:
+                        continue
+                    seen.add(n)
+                    out.append(n)
+                return out
+            finally:
+                try:
+                    stencil.Close()
+                except Exception:
+                    pass
+        finally:
+            pythoncom.CoUninitialize()
 
     # ----------------------------------------------------------
     # Replace the currently selected Visio shape with another master
@@ -292,6 +347,127 @@ class VisioEngine:
                     label_text = (label_text or "").strip()
                     if bbox and label_text:
                         self._place_label_top_left(page, bbox, label_text)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    stencil.Close()
+                except Exception:
+                    pass
+        finally:
+            pythoncom.CoUninitialize()
+
+    # ----------------------------------------------------------
+    # Replace a specific shape (by IDs) with a master from a given
+    # stencil file, preserving position/size/rotation.
+    # ----------------------------------------------------------
+    def replace_shape_by_id(self, page_id, shape_id, stencil_path, replacement_master_name, label_text=None):
+        pythoncom.CoInitialize()
+        try:
+            if not stencil_path:
+                raise Exception("Stencil path is required.")
+            if not os.path.exists(stencil_path):
+                raise Exception("Stencil not found.")
+            if not replacement_master_name:
+                raise Exception("Replacement master name is required.")
+            if not page_id or not shape_id:
+                raise Exception("No Visio shape selected.")
+
+            app, docs = self._get_visio()
+
+            doc = getattr(app, "ActiveDocument", None)
+            if doc is None:
+                raise Exception("No active Visio document.")
+
+            page = None
+            try:
+                page = doc.Pages.ItemFromID(int(page_id))
+            except Exception:
+                # fallback search
+                try:
+                    for p in doc.Pages:
+                        try:
+                            if int(getattr(p, "ID", 0)) == int(page_id):
+                                page = p
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    page = None
+            if page is None:
+                raise Exception("Could not find the selected shape's page.")
+
+            old_shape = None
+            try:
+                old_shape = page.Shapes.ItemFromID(int(shape_id))
+            except Exception:
+                old_shape = None
+            if old_shape is None:
+                raise Exception("Could not find the selected shape (maybe it was deleted).")
+
+            def _cell_result_iu(shp, cell_name, default=None):
+                try:
+                    return float(shp.CellsU(cell_name).ResultIU)
+                except Exception:
+                    return default
+
+            x = _cell_result_iu(old_shape, "PinX", 0.0)
+            y = _cell_result_iu(old_shape, "PinY", 0.0)
+            width = _cell_result_iu(old_shape, "Width", None)
+            height = _cell_result_iu(old_shape, "Height", None)
+            angle = _cell_result_iu(old_shape, "Angle", None)
+
+            # Open stencil (copy for safety)
+            base = os.path.basename(stencil_path)
+            stencil_copy = os.path.join(tempfile.gettempdir(), f"replacefile_{int(time.time() * 1000)}_{base}")
+            shutil.copy2(stencil_path, stencil_copy)
+            stencil = docs.OpenEx(stencil_copy, 64)
+            try:
+                new_master = None
+                try:
+                    new_master = stencil.Masters.Item(replacement_master_name)
+                except Exception:
+                    for m in stencil.Masters:
+                        try:
+                            if self._normalize(m.Name).lower() == self._normalize(replacement_master_name).lower():
+                                new_master = m
+                                break
+                        except Exception:
+                            continue
+
+                if new_master is None:
+                    raise Exception(f"Replacement master '{replacement_master_name}' not found in selected stencil.")
+
+                new_shape = page.Drop(new_master, x, y)
+
+                # Preserve basic transforms (best-effort)
+                if width is not None:
+                    try:
+                        new_shape.CellsU("Width").ResultIU = float(width)
+                    except Exception:
+                        pass
+                if height is not None:
+                    try:
+                        new_shape.CellsU("Height").ResultIU = float(height)
+                    except Exception:
+                        pass
+                if angle is not None:
+                    try:
+                        new_shape.CellsU("Angle").ResultIU = float(angle)
+                    except Exception:
+                        pass
+
+                try:
+                    old_shape.Delete()
+                except Exception:
+                    pass
+
+                # Add label textbox above the replacement (simple & reliable)
+                try:
+                    bbox = self._get_shape_bbox(new_shape)
+                    txt = (label_text or replacement_master_name or "").strip()
+                    if bbox and txt:
+                        self._place_label_top_left(page, bbox, txt)
                 except Exception:
                     pass
             finally:
