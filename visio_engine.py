@@ -593,6 +593,17 @@ class VisioEngine:
                 if new_master is None:
                     raise Exception(f"Replacement master '{replacement_master_name}' not found in selected stencil.")
 
+                # Track page shapes before drop/ungroup to return internal typed parts
+                before_ids = set()
+                try:
+                    for s in page.Shapes:
+                        try:
+                            before_ids.add(int(getattr(s, "ID", 0)))
+                        except Exception:
+                            continue
+                except Exception:
+                    before_ids = set()
+
                 new_shape = page.Drop(new_master, x, y)
 
                 # Preserve basic transforms (best-effort)
@@ -617,12 +628,18 @@ class VisioEngine:
                 except Exception:
                     pass
 
-                # Add label textbox above the replacement (simple & reliable)
+                # If replacement is a group, ungroup so internal objects are addressable.
+                bbox_before = self._get_shape_bbox(new_shape)
                 try:
-                    bbox = self._get_shape_bbox(new_shape)
-                    txt = (label_text or replacement_master_name or "").strip()
-                    if bbox and txt:
-                        self._place_label_top_left(page, bbox, txt)
+                    self._try_ungroup(new_shape)
+                except Exception:
+                    pass
+
+                # Add label textbox above the replacement (optional)
+                try:
+                    txt = (label_text or "").strip()
+                    if txt and bbox_before:
+                        self._place_label_top_left(page, bbox_before, txt)
                 except Exception:
                     pass
             finally:
@@ -633,11 +650,51 @@ class VisioEngine:
 
             # Return new shape info so UI can refresh
             try:
+                # Compute created ids from the replacement drop/ungroup so UI can show internal typed shapes.
+                created_ids = set()
+                try:
+                    after_ids = set()
+                    for s in page.Shapes:
+                        try:
+                            after_ids.add(int(getattr(s, "ID", 0)))
+                        except Exception:
+                            continue
+                    created_ids = after_ids - before_ids
+                except Exception:
+                    created_ids = set()
+
+                parts = []
+                for sid in sorted(created_ids):
+                    try:
+                        s = page.Shapes.ItemFromID(int(sid))
+                    except Exception:
+                        continue
+                    tv = None
+                    try:
+                        tv = self.get_type_value(s)
+                    except Exception:
+                        tv = None
+                    if not tv:
+                        continue
+                    try:
+                        sd = self.get_shape_data(s)
+                    except Exception:
+                        sd = {}
+                    parts.append(
+                        {
+                            "page_id": int(getattr(page, "ID", 0)),
+                            "shape_id": int(getattr(s, "ID", 0)),
+                            "type_value": tv,
+                            "shape_data": sd,
+                        }
+                    )
+
                 return {
                     "page_id": int(getattr(page, "ID", 0)),
                     "shape_id": int(getattr(new_shape, "ID", 0)),
                     "type_value": self.get_type_value(new_shape),
                     "shape_data": self.get_shape_data(new_shape),
+                    "parts": parts,
                 }
             except Exception:
                 return None
@@ -748,17 +805,9 @@ class VisioEngine:
                 raise Exception(f"Central master '{central_name}' not found.")
 
             label_text = custom_label if custom_label else central_name
-            central_shape = self._drop_shape_with_label(page, central_master, CENTRAL_X, CENTRAL_Y, label_text)
-            if central_shape is not None:
-                try:
-                    layout_meta["central"] = {
-                        "shape_id": int(getattr(central_shape, "ID", 0)),
-                        "page_id": int(getattr(page, "ID", 0)),
-                        "type_value": self.get_type_value(central_shape),
-                        "shape_data": self.get_shape_data(central_shape),
-                    }
-                except Exception:
-                    layout_meta["central"] = None
+            central_info = self._drop_substation_with_parts(page, central_master, CENTRAL_X, CENTRAL_Y, label_text)
+            if central_info is not None:
+                layout_meta["central"] = central_info
 
             # Matrix
             matrix = data.get("matrix_subs", [])
@@ -820,22 +869,11 @@ class VisioEngine:
 
                     x = start_x + c * H_SPACING
                     label = cell_label if cell_label else cell_name
-                    shp = self._drop_shape_with_label(page, m_obj, x, y, label)
-                    if shp is None:
+                    info = self._drop_substation_with_parts(page, m_obj, x, y, label)
+                    if info is None:
                         layout_meta["matrix"][r].append(None)
-                        continue
-
-                    try:
-                        layout_meta["matrix"][r].append(
-                            {
-                                "shape_id": int(getattr(shp, "ID", 0)),
-                                "page_id": int(getattr(page, "ID", 0)),
-                            "type_value": self.get_type_value(shp),
-                            "shape_data": self.get_shape_data(shp),
-                            }
-                        )
-                    except Exception:
-                        layout_meta["matrix"][r].append(None)
+                    else:
+                        layout_meta["matrix"][r].append(info)
 
             # Fit view
             try:
@@ -848,26 +886,106 @@ class VisioEngine:
         finally:
             pythoncom.CoUninitialize()
 
-    def _drop_shape_with_label(self, page, master, x, y, label_text):
+    def _drop_substation_with_parts(self, page, master, x, y, label_text):
+        """
+        Drop a (possibly grouped) master as a "substation", ungroup it so internal
+        objects become addressable, and return ONLY Shape Data-driven identifiers:
+
+          {
+            "page_id": <int>,
+            "shape_id": <int|None>,   # best-effort root id (may not survive ungroup)
+            "parts": [
+               {"page_id":..., "shape_id":..., "type_value":..., "shape_data": {...}},
+               ...
+            ]
+          }
+
+        The label_text is placed as a textbox above the substation (based on the
+        pre-ungroup bounding box so it is stable).
+        """
         try:
+            before_ids = set()
+            try:
+                for s in page.Shapes:
+                    try:
+                        before_ids.add(int(getattr(s, "ID", 0)))
+                    except Exception:
+                        continue
+            except Exception:
+                before_ids = set()
+
             shp = page.Drop(master, x, y)
         except Exception:
             return None
 
         bbox_before = self._get_shape_bbox(shp)
 
-        # Ungroup after drop (so child shapes become accessible), but keep label based on final bbox if possible.
-        self._try_ungroup(shp)
+        # Ungroup after drop, so internal shapes are independent objects on the page.
+        try:
+            self._try_ungroup(shp)
+        except Exception:
+            pass
 
-        bbox = self._get_shape_bbox(shp) or bbox_before
+        # Determine which shapes were created by this drop/ungroup.
+        created_ids = set()
+        try:
+            after_ids = set()
+            for s in page.Shapes:
+                try:
+                    after_ids.add(int(getattr(s, "ID", 0)))
+                except Exception:
+                    continue
+            created_ids = after_ids - before_ids
+        except Exception:
+            created_ids = set()
 
-        if label_text and bbox:
+        # If we couldn't diff, fall back to the dropped shape itself.
+        try:
+            root_id = int(getattr(shp, "ID", 0))
+        except Exception:
+            root_id = None
+        if not created_ids and root_id:
+            created_ids = {root_id}
+
+        parts = []
+        for sid in sorted(created_ids):
             try:
-                self._place_label_top_left(page, bbox, label_text)
+                s = page.Shapes.ItemFromID(int(sid))
+            except Exception:
+                continue
+            try:
+                tv = self.get_type_value(s)
+            except Exception:
+                tv = None
+            if not tv:
+                # Per your rule: identification is via Prop.TYPE.Value only; skip if missing.
+                continue
+            try:
+                sd = self.get_shape_data(s)
+            except Exception:
+                sd = {}
+            parts.append(
+                {
+                    "page_id": int(getattr(page, "ID", 0)),
+                    "shape_id": int(getattr(s, "ID", 0)),
+                    "type_value": tv,
+                    "shape_data": sd,
+                }
+            )
+
+        # Place substation label textbox above the whole drop.
+        txt = (label_text or "").strip()
+        if txt and bbox_before:
+            try:
+                self._place_label_top_left(page, bbox_before, txt)
             except Exception:
                 pass
 
-        return shp
+        return {
+            "page_id": int(getattr(page, "ID", 0)),
+            "shape_id": root_id,
+            "parts": parts,
+        }
 
     def _get_shape_bbox(self, shp):
         if shp is None:

@@ -17,11 +17,10 @@ class SubstationApp:
         self.engine = visio_engine.VisioEngine()
         # list of dicts {'name':..., 'props':[...] }
         self.loaded_masters = []
-        # lookup name -> props list
+        # lookup name -> (unused) shape_data list; we keep keys for selection
         self.masters_by_name = {}
         # matrix structure holds rows of dicts {'combobox':..., 'props_frame':...}
         self.matrix_widgets = []
-        self._replace_target = None  # {"page_id":..., "shape_id":..., "row":..., "col":..., "kind":...}
         self._central_visio = None  # {"page_id":..., "shape_id":...} set after generation
 
         self.setup_ui()
@@ -61,24 +60,6 @@ class SubstationApp:
         tk.Button(top, text="Generate Visio Layout", bg="green", fg="white", command=self.on_generate).grid(
             row=4, column=0, columnspan=3, pady=12, sticky="ew"
         )
-
-        # Central Shape Data (from ShapeSheet Prop rows of the master)
-        central_sd = tk.LabelFrame(self.root, text="Central Shape Data (ShapeSheet)", padx=10, pady=6)
-        central_sd.pack(fill="x", padx=10, pady=(0, 6))
-        self.central_sd_text = tk.Text(central_sd, height=6, wrap="none", state="disabled")
-        self.central_sd_text.pack(side="left", fill="both", expand=True)
-        central_sd_scroll = tk.Scrollbar(central_sd, orient="vertical", command=self.central_sd_text.yview)
-        central_sd_scroll.pack(side="right", fill="y")
-        self.central_sd_text.configure(yscrollcommand=central_sd_scroll.set)
-
-        # Global preview (keeps original preview behavior)
-        preview_frame = tk.LabelFrame(self.root, text="Shape Data Preview (ShapeSheet)", padx=10, pady=6)
-        preview_frame.pack(fill="x", padx=10, pady=(0, 6))
-        self.shape_data_text = tk.Text(preview_frame, height=8, wrap="none", state="disabled")
-        self.shape_data_text.pack(side="left", fill="both", expand=True)
-        preview_scroll = tk.Scrollbar(preview_frame, orient="vertical", command=self.shape_data_text.yview)
-        preview_scroll.pack(side="right", fill="y")
-        self.shape_data_text.configure(yscrollcommand=preview_scroll.set)
 
         # Scrollable area for matrix
         container = tk.Frame(self.root)
@@ -165,15 +146,13 @@ class SubstationApp:
     def _after_load_stencil(self, masters):
         # masters: list of dicts {'name':..., 'shape_data': [...]}
         self.loaded_masters = masters
-        # master_name -> list of {"label":..., "value":...}
-        self.masters_by_name = {m["name"]: m.get("shape_data", []) for m in masters}
+        # Keep ONLY master names for selection; do not display master shape data anywhere.
+        self.masters_by_name = {m["name"]: [] for m in masters}
         names = list(self.masters_by_name.keys())
         self.lbl_stencil.config(text="Stencil Loaded", fg="black")
         self.cb_central["values"] = names
         if names:
             self.cb_central.current(0)
-            self._render_central_shape_data(names[0])
-            self._render_preview_shape_data(names[0])
         messagebox.showinfo("Success", f"Loaded {len(names)} masters.")
         # Matrix cell Shape Data is shown per-cell, based on selected master and/or generated shape.
 
@@ -263,16 +242,8 @@ class SubstationApp:
 
         cell_state["selected_master"] = name
         cell_state["selected_props"] = []
-
-        # Show ShapeSheet Shape Data for the *master* (drop-to-temp is done in engine load)
-        self._render_cell_shape_data(
-            cell_state,
-            row_idx=None,
-            col_idx=None,
-            shape_data_rows=self.masters_by_name.get(name, []),
-            show_replace_button=False,
-        )
-        self._render_preview_shape_data(name)
+        # Do NOT show master-based data. We'll show per-substation (dropped) shape data after generation.
+        tk.Label(props_frame, text="(generate layout to view Shape Data for this substation)", fg="gray").pack(anchor="w")
 
     # ------------------------
     # Generate layout in Visio
@@ -305,110 +276,231 @@ class SubstationApp:
         threading.Thread(target=self._thread_generate, args=(data,), daemon=True).start()
 
     def _on_central_selected(self, event=None):
-        name = self.cb_central.get()
-        if name:
-            self._render_central_shape_data(name)
-            self._render_preview_shape_data(name)
-
-    def _render_central_shape_data(self, master_name):
-        rows = self.masters_by_name.get(master_name, [])
-        lines = [f"Master: {master_name}", "-" * 40]
-        for r in rows:
-            lbl = (r.get("label") or "").strip()
-            val = (r.get("value") or "").strip()
-            if lbl:
-                lines.append(f"{lbl}: {val}")
-        if len(lines) == 2:
-            lines.append("(no Shape Data)")
-        text_value = "\n".join(lines)
-        self.central_sd_text.configure(state="normal")
-        self.central_sd_text.delete("1.0", tk.END)
-        self.central_sd_text.insert(tk.END, text_value)
-        self.central_sd_text.configure(state="disabled")
-
-    def _render_preview_shape_data(self, master_name):
-        # Global preview panel (same ShapeSheet label/value list)
-        rows = self.masters_by_name.get(master_name, [])
-        lines = [f"Master: {master_name}", "-" * 40]
-        for r in rows:
-            lbl = (r.get("label") or "").strip()
-            val = (r.get("value") or "").strip()
-            if lbl:
-                lines.append(f"{lbl}: {val}")
-        if len(lines) == 2:
-            lines.append("(no Shape Data)")
-
-        text_value = "\n".join(lines)
-        try:
-            self.shape_data_text.configure(state="normal")
-            self.shape_data_text.delete("1.0", tk.END)
-            self.shape_data_text.insert(tk.END, text_value)
-            self.shape_data_text.configure(state="disabled")
-        except Exception:
-            pass
-
-    def _set_replace_target(self, cell_state, row_idx=None, col_idx=None):
-        page_id = cell_state.get("visio_page_id")
-        shape_id = cell_state.get("visio_shape_id")
-        if not page_id or not shape_id:
-            return
-        self._replace_target = {
-            "page_id": page_id,
-            "shape_id": shape_id,
-            "row": row_idx,
-            "col": col_idx,
-            "kind": "matrix_cell",
-        }
+        # No central/global shape-data panels; per-substation only.
+        return
 
     def _render_cell_shape_data(self, cell_state, row_idx, col_idx, shape_data_rows, show_replace_button):
         pf = cell_state["props_frame"]
         for w in pf.winfo_children():
             w.destroy()
 
-        # Display Shape Data ONLY (Label/Value) and actions for dropped shapes
+        # shape_data_rows here is expected to be:
+        #   {"parts": [ {page_id, shape_id, type_value, shape_data}, ... ] }
+        # or a legacy list/dict for a single shape.
+
         title = tk.Label(pf, text="Shape Data", font=("Arial", 9, "bold"))
         title.pack(anchor="w")
 
-        def _select_target(_event=None):
-            self._set_replace_target(cell_state, row_idx=row_idx, col_idx=col_idx)
+        parts = None
+        if isinstance(shape_data_rows, dict) and "parts" in shape_data_rows:
+            parts = shape_data_rows.get("parts") or []
 
-        if show_replace_button:
-            title.bind("<Button-1>", _select_target)
+        if parts is None:
+            # legacy single-shape rendering
+            if show_replace_button:
+                actions = tk.Frame(pf)
+                actions.pack(anchor="w", pady=(4, 4))
+                tk.Button(actions, text="Replace…", command=lambda: self._replace_via_dialog(cell_state)).pack(side="left")
+                tk.Button(actions, text="Delete", command=lambda: self._delete_shape(cell_state)).pack(side="left", padx=(8, 0))
 
-            actions = tk.Frame(pf)
-            actions.pack(anchor="w", pady=(4, 4))
-            tk.Button(actions, text="Replace…", command=lambda: self._replace_via_dialog(cell_state)).pack(side="left")
-            tk.Button(actions, text="Delete", command=lambda: self._delete_shape(cell_state)).pack(side="left", padx=(8, 0))
+            if not shape_data_rows:
+                tk.Label(pf, text="(no ShapeSheet Shape Data rows found)", fg="gray").pack(anchor="w")
+                return
 
-        if not shape_data_rows:
-            lbl = tk.Label(pf, text="(no ShapeSheet Shape Data rows found)", fg="gray")
-            lbl.pack(anchor="w")
+            header = tk.Frame(pf)
+            header.pack(fill="x", anchor="w")
+            tk.Label(header, text="Label", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+            tk.Label(header, text="Value", font=("Arial", 9, "bold")).grid(row=0, column=1, sticky="w")
+
+            if isinstance(shape_data_rows, dict):
+                iterable = list(shape_data_rows.values())
+            else:
+                iterable = shape_data_rows
+
+            for r in iterable:
+                lbl = (r.get("label") or "").strip()
+                val = (r.get("value") or "").strip()
+                row = tk.Frame(pf)
+                row.pack(fill="x", anchor="w", pady=1)
+                tk.Label(row, text=lbl, anchor="w", width=18).grid(row=0, column=0, sticky="w", padx=(0, 8))
+                tk.Label(row, text=val, anchor="w", wraplength=280, justify="left").grid(row=0, column=1, sticky="w")
             return
 
-        header = tk.Frame(pf)
-        header.pack(fill="x", anchor="w")
-        tk.Label(header, text="Label", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
-        tk.Label(header, text="Value", font=("Arial", 9, "bold")).grid(row=0, column=1, sticky="w")
+        # New: render internal typed shapes for this substation. Replace/Delete targets the specific object only.
+        if not parts:
+            tk.Label(pf, text="(no internal shapes found with Prop.TYPE.Value)", fg="gray").pack(anchor="w")
+            return
 
-        # shape_data_rows can be list[{"label","value"}] or dict[row_name]->{...}
-        if isinstance(shape_data_rows, dict):
-            iterable = list(shape_data_rows.values())
-        else:
-            iterable = shape_data_rows
+        # Disambiguate duplicates of TYPE by adding an index, but still show TYPE text.
+        type_counts = {}
+        for p in parts:
+            tv = (p.get("type_value") or "").strip()
+            type_counts[tv] = type_counts.get(tv, 0) + 1
+        type_seen = {}
 
-        for r in iterable:
-            lbl = (r.get("label") or "").strip()
-            val = (r.get("value") or "").strip()
-            row = tk.Frame(pf)
-            row.pack(fill="x", anchor="w", pady=1)
-            l1 = tk.Label(row, text=lbl, anchor="w", width=18)
-            l1.grid(row=0, column=0, sticky="w", padx=(0, 8))
-            l2 = tk.Label(row, text=val, anchor="w", wraplength=280, justify="left")
-            l2.grid(row=0, column=1, sticky="w")
+        for p in parts:
+            tv = (p.get("type_value") or "").strip()
+            sd = p.get("shape_data") or {}
+            page_id = p.get("page_id")
+            shape_id = p.get("shape_id")
 
-            if show_replace_button:
-                for w in (row, l1, l2):
-                    w.bind("<Button-1>", _select_target)
+            type_seen[tv] = type_seen.get(tv, 0) + 1
+            suffix = ""
+            if type_counts.get(tv, 0) > 1:
+                suffix = f" ({type_seen[tv]})"
+
+            block = tk.LabelFrame(pf, text=f"TYPE: {tv}{suffix}", padx=6, pady=4)
+            block.pack(fill="x", anchor="w", pady=(6, 0))
+
+            actions = tk.Frame(block)
+            actions.pack(anchor="w", pady=(0, 6))
+            tk.Button(
+                actions,
+                text="Replace…",
+                command=lambda part=p: self._replace_part_via_dialog(cell_state, part),
+            ).pack(side="left")
+            tk.Button(
+                actions,
+                text="Delete",
+                command=lambda part=p: self._delete_part(cell_state, part),
+            ).pack(side="left", padx=(8, 0))
+
+            if not sd:
+                tk.Label(block, text="(no Prop rows)", fg="gray").pack(anchor="w")
+                continue
+
+            header = tk.Frame(block)
+            header.pack(fill="x", anchor="w")
+            tk.Label(header, text="Label", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+            tk.Label(header, text="Value", font=("Arial", 9, "bold")).grid(row=0, column=1, sticky="w")
+
+            for _row_name, row_dict in sd.items():
+                lbl = (row_dict.get("label") or "").strip()
+                val = (row_dict.get("value") or "").strip()
+                row = tk.Frame(block)
+                row.pack(fill="x", anchor="w", pady=1)
+                tk.Label(row, text=lbl, anchor="w", width=18).grid(row=0, column=0, sticky="w", padx=(0, 8))
+                tk.Label(row, text=val, anchor="w", wraplength=280, justify="left").grid(row=0, column=1, sticky="w")
+
+    def _delete_part(self, cell_state, part):
+        page_id = part.get("page_id")
+        shape_id = part.get("shape_id")
+        if not page_id or not shape_id:
+            return
+        if not messagebox.askyesno("Confirm delete", "Delete this object from the substation?"):
+            return
+
+        def _run():
+            try:
+                self.engine.delete_shape_by_id(page_id, shape_id)
+
+                def _after():
+                    parts = (cell_state.get("parts") or [])
+                    cell_state["parts"] = [p for p in parts if p.get("shape_id") != shape_id or p.get("page_id") != page_id]
+                    self._render_cell_shape_data(cell_state, None, None, {"parts": cell_state.get("parts") or []}, show_replace_button=True)
+                    messagebox.showinfo("Deleted", "Object deleted.")
+
+                self.root.after(0, _after)
+            except Exception:
+                tb = traceback.format_exc()
+                self.root.after(0, lambda: messagebox.showerror("Error", tb))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _replace_part_via_dialog(self, cell_state, part):
+        page_id = part.get("page_id")
+        shape_id = part.get("shape_id")
+        if not page_id or not shape_id:
+            return
+
+        stencil_path = filedialog.askopenfilename(filetypes=[("Visio Stencil", "*.vssx *.vss *.vstx")])
+        if not stencil_path:
+            return
+
+        def _run():
+            try:
+                masters = self.engine.get_stencil_master_names(stencil_path)
+                if not masters:
+                    raise Exception("No masters found in selected stencil.")
+
+                if len(masters) == 1:
+                    chosen = masters[0]
+                else:
+                    chosen_holder = {"val": None}
+
+                    def _ask():
+                        dlg = tk.Toplevel(self.root)
+                        dlg.title("Choose replacement master")
+                        tk.Label(dlg, text="Select master to replace with:").pack(anchor="w", padx=10, pady=(10, 4))
+                        cb = ttk.Combobox(dlg, state="readonly", values=masters, width=60)
+                        cb.pack(padx=10, pady=(0, 10))
+                        cb.current(0)
+
+                        def _ok():
+                            chosen_holder["val"] = cb.get()
+                            dlg.destroy()
+
+                        tk.Button(dlg, text="OK", command=_ok).pack(pady=(0, 10))
+                        dlg.transient(self.root)
+                        dlg.grab_set()
+                        self.root.wait_window(dlg)
+
+                    self.root.after(0, _ask)
+                    for _ in range(600):
+                        if chosen_holder["val"] is not None:
+                            break
+                        time.sleep(0.05)
+                    chosen = chosen_holder["val"]
+
+                if not chosen:
+                    return
+
+                # Replace only the clicked object. Keep the substation label as-is (we don't re-label on part replacement).
+                result = self.engine.replace_shape_by_id(
+                    page_id=page_id,
+                    shape_id=shape_id,
+                    stencil_path=stencil_path,
+                    replacement_master_name=chosen,
+                    label_text=None,
+                )
+
+                def _after():
+                    if not isinstance(result, dict):
+                        return
+
+                    # result may be a single shape or a grouped replacement (parts)
+                    new_parts = result.get("parts")
+                    if not new_parts:
+                        new_parts = [
+                            {
+                                "page_id": result.get("page_id"),
+                                "shape_id": result.get("shape_id"),
+                                "type_value": result.get("type_value"),
+                                "shape_data": result.get("shape_data") or {},
+                            }
+                        ]
+
+                    old_parts = cell_state.get("parts") or []
+                    replaced = []
+                    for p in old_parts:
+                        if p.get("page_id") == page_id and p.get("shape_id") == shape_id:
+                            replaced.extend(new_parts)
+                        else:
+                            replaced.append(p)
+                    cell_state["parts"] = replaced
+                    self._render_cell_shape_data(cell_state, None, None, {"parts": replaced}, show_replace_button=True)
+                    messagebox.showinfo("Success", "Object replaced.")
+
+                self.root.after(0, _after)
+            except Exception:
+                tb = traceback.format_exc()
+                try:
+                    print(tb, file=sys.stderr)
+                except Exception:
+                    pass
+                self.root.after(0, lambda: messagebox.showerror("Error", tb))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _delete_shape(self, cell_state):
         page_id = cell_state.get("visio_page_id")
@@ -453,8 +545,11 @@ class SubstationApp:
             self.root.after(0, _after)
         except Exception as e:
             tb = traceback.format_exc()
-            print(tb)
-            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+            try:
+                print(tb, file=sys.stderr)
+            except Exception:
+                pass
+            self.root.after(0, lambda: messagebox.showerror("Error", tb))
 
     def _apply_layout_meta(self, meta):
         matrix = (meta or {}).get("matrix", [])
@@ -472,11 +567,14 @@ class SubstationApp:
                 if info and isinstance(info, dict):
                     cell_state["visio_shape_id"] = info.get("shape_id")
                     cell_state["visio_page_id"] = info.get("page_id")
-                    # show ShapeSheet data for the actual dropped shape and enable Replace button
-                    self._render_cell_shape_data(cell_state, r, c, info.get("shape_data", []), show_replace_button=True)
+                    parts = info.get("parts") or []
+                    cell_state["parts"] = parts
+                    # show ShapeSheet data for internal typed shapes and enable Replace/Delete per object
+                    self._render_cell_shape_data(cell_state, r, c, {"parts": parts}, show_replace_button=True)
                 else:
                     cell_state["visio_shape_id"] = None
                     cell_state["visio_page_id"] = None
+                    cell_state["parts"] = []
                     pf = cell_state["props_frame"]
                     for w in pf.winfo_children():
                         w.destroy()
