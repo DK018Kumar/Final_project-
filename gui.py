@@ -22,6 +22,7 @@ class SubstationApp:
         # matrix structure holds rows of dicts {'combobox':..., 'props_frame':...}
         self.matrix_widgets = []
         self._central_visio = None  # {"page_id":..., "shape_id":...} set after generation
+        self._generated_doc_name = None
 
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -490,7 +491,8 @@ class SubstationApp:
 
         def _run():
             try:
-                self.engine.delete_shape_by_id(page_id, shape_id)
+                doc_name = cell_state.get("visio_document_name") or self._generated_doc_name
+                self.engine.delete_shape_by_id(page_id, shape_id, document_name=doc_name)
 
                 def _after():
                     parts = (cell_state.get("parts") or [])
@@ -554,12 +556,14 @@ class SubstationApp:
                     return
 
                 # Replace only the clicked object. Keep the substation label as-is (we don't re-label on part replacement).
+                doc_name = cell_state.get("visio_document_name") or self._generated_doc_name
                 result = self.engine.replace_shape_by_id(
                     page_id=page_id,
                     shape_id=shape_id,
                     stencil_path=stencil_path,
                     replacement_master_name=chosen,
                     label_text=None,
+                    document_name=doc_name,
                 )
 
                 def _after():
@@ -612,7 +616,8 @@ class SubstationApp:
 
         def _run():
             try:
-                self.engine.delete_shape_by_id(page_id, shape_id)
+                doc_name = cell_state.get("visio_document_name") or self._generated_doc_name
+                self.engine.delete_shape_by_id(page_id, shape_id, document_name=doc_name)
 
                 def _after():
                     cell_state["visio_page_id"] = None
@@ -652,6 +657,7 @@ class SubstationApp:
     def _apply_layout_meta(self, meta):
         matrix = (meta or {}).get("matrix", [])
         central = (meta or {}).get("central")
+        self._generated_doc_name = (meta or {}).get("document_name") or None
         if isinstance(central, dict):
             self._central_visio = {"page_id": central.get("page_id"), "shape_id": central.get("shape_id")}
         for r, row in enumerate(self.matrix_widgets):
@@ -665,6 +671,7 @@ class SubstationApp:
                 if info and isinstance(info, dict):
                     cell_state["visio_shape_id"] = info.get("shape_id")
                     cell_state["visio_page_id"] = info.get("page_id")
+                    cell_state["visio_document_name"] = self._generated_doc_name
                     parts = info.get("parts") or []
                     cell_state["parts"] = parts
                     # show ShapeSheet data for internal typed shapes and enable Replace/Delete per object
@@ -672,6 +679,7 @@ class SubstationApp:
                 else:
                     cell_state["visio_shape_id"] = None
                     cell_state["visio_page_id"] = None
+                    cell_state["visio_document_name"] = self._generated_doc_name
                     cell_state["parts"] = []
                     pf = cell_state["props_frame"]
                     for w in pf.winfo_children():
@@ -742,12 +750,14 @@ class SubstationApp:
                     return
 
                 label = (cell_state.get("label_entry").get() or "").strip() if cell_state.get("label_entry") else ""
+                doc_name = cell_state.get("visio_document_name") or self._generated_doc_name
                 result = self.engine.replace_shape_by_id(
                     page_id=page_id,
                     shape_id=shape_id,
                     stencil_path=stencil_path,
                     replacement_master_name=chosen,
                     label_text=label or None,
+                    document_name=doc_name,
                 )
                 def _after():
                     if isinstance(result, dict):

@@ -33,12 +33,19 @@ class VisioEngine:
                 # stale COM reference; recreate
                 app = None
 
-        # Create a new Visio instance in *this* thread's COM apartment
+        # IMPORTANT:
+        # We must act on the SAME running Visio instance that created the drawing,
+        # otherwise shape IDs won't exist and replace/delete will appear to "do nothing".
+        # Each thread gets its own COM proxy, but it should connect to the same Visio.
         try:
-            app = win32com.client.DispatchEx("Visio.Application")
+            app = win32com.client.GetActiveObject("Visio.Application")
         except Exception:
-            # Fallback for older setups
-            app = win32com.client.Dispatch("Visio.Application")
+            try:
+                # Attach to a running instance (or start it)
+                app = win32com.client.Dispatch("Visio.Application")
+            except Exception:
+                # Last resort: create a new instance
+                app = win32com.client.DispatchEx("Visio.Application")
 
         try:
             app.Visible = True
@@ -47,6 +54,32 @@ class VisioEngine:
 
         self._apps_by_thread[tid] = app
         return app, app.Documents
+
+    def _get_document(self, app, document_name=None):
+        """
+        Return the Visio Document to operate on.
+        - If document_name is provided, find it in app.Documents by exact name (case-insensitive).
+        - Else fall back to ActiveDocument.
+        """
+        if app is None:
+            return None
+        if document_name:
+            wanted = str(document_name).strip().lower()
+            if wanted:
+                try:
+                    for d in app.Documents:
+                        try:
+                            nm = str(getattr(d, "Name", "") or "").strip().lower()
+                        except Exception:
+                            nm = ""
+                        if nm == wanted:
+                            return d
+                except Exception:
+                    pass
+        try:
+            return getattr(app, "ActiveDocument", None)
+        except Exception:
+            return None
 
     def _normalize(self, name):
         return " ".join(name.strip().split()) if name else ""
@@ -516,7 +549,7 @@ class VisioEngine:
     # Replace a specific shape (by IDs) with a master from a given
     # stencil file, preserving position/size/rotation.
     # ----------------------------------------------------------
-    def replace_shape_by_id(self, page_id, shape_id, stencil_path, replacement_master_name, label_text=None):
+    def replace_shape_by_id(self, page_id, shape_id, stencil_path, replacement_master_name, label_text=None, document_name=None):
         pythoncom.CoInitialize()
         try:
             if not stencil_path:
@@ -530,7 +563,7 @@ class VisioEngine:
 
             app, docs = self._get_visio()
 
-            doc = getattr(app, "ActiveDocument", None)
+            doc = self._get_document(app, document_name=document_name)
             if doc is None:
                 raise Exception("No active Visio document.")
 
@@ -701,11 +734,11 @@ class VisioEngine:
         finally:
             pythoncom.CoUninitialize()
 
-    def delete_shape_by_id(self, page_id, shape_id):
+    def delete_shape_by_id(self, page_id, shape_id, document_name=None):
         pythoncom.CoInitialize()
         try:
             app, _docs = self._get_visio()
-            doc = getattr(app, "ActiveDocument", None)
+            doc = self._get_document(app, document_name=document_name)
             if doc is None:
                 raise Exception("No active Visio document.")
 
