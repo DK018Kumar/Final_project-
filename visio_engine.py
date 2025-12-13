@@ -12,18 +12,41 @@ from win32com.client import constants
 class VisioEngine:
     def __init__(self):
         self.current_stencil_path = None
+        # IMPORTANT: COM objects are apartment-threaded. Do not share a Visio
+        # Application COM object across threads. We keep one instance per thread.
+        self._apps_by_thread = {}
         self._selection_thread = None
         self._selection_stop = None
 
     # Always return a stable Visio instance (visible = True)
     def _get_visio(self):
+        tid = threading.get_ident()
+
+        app = self._apps_by_thread.get(tid)
+        if app is not None:
+            try:
+                # Touch it to ensure it's still alive
+                _ = app.Visible
+                app.Visible = True
+                return app, app.Documents
+            except Exception:
+                # stale COM reference; recreate
+                app = None
+
+        # Create a new Visio instance in *this* thread's COM apartment
         try:
-            app = win32com.client.GetActiveObject("Visio.Application")
+            app = win32com.client.DispatchEx("Visio.Application")
         except Exception:
+            # Fallback for older setups
             app = win32com.client.Dispatch("Visio.Application")
-        app.Visible = True
-        docs = app.Documents
-        return app, docs
+
+        try:
+            app.Visible = True
+        except Exception:
+            pass
+
+        self._apps_by_thread[tid] = app
+        return app, app.Documents
 
     def _normalize(self, name):
         return " ".join(name.strip().split()) if name else ""
