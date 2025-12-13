@@ -68,6 +68,22 @@ class SubstationApp:
             offvalue=False,
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
+        # Replace selected shape controls (uses the loaded stencil masters)
+        replace_frame = tk.LabelFrame(top, text="Replace Selected Shape in Visio", padx=8, pady=6)
+        replace_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+
+        tk.Label(replace_frame, text="New Master:").grid(row=0, column=0, sticky="w")
+        self.cb_replace_master = ttk.Combobox(replace_frame, state="readonly", width=50)
+        self.cb_replace_master.grid(row=0, column=1, sticky="w", padx=(6, 10))
+
+        tk.Label(replace_frame, text="Label (optional):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.entry_replace_label = tk.Entry(replace_frame, width=52)
+        self.entry_replace_label.grid(row=1, column=1, sticky="w", padx=(6, 10), pady=(6, 0))
+
+        tk.Button(replace_frame, text="Replace Selected", command=self.on_replace_selected).grid(
+            row=0, column=2, rowspan=2, padx=(6, 0), sticky="ns"
+        )
+
         # Shape data preview block
         preview_frame = tk.LabelFrame(self.root, text="Shape Data Preview", padx=10, pady=6)
         preview_frame.pack(fill="x", padx=10, pady=(0, 6))
@@ -160,6 +176,11 @@ class SubstationApp:
         names = list(self.masters_by_name.keys())
         self.lbl_stencil.config(text="Stencil Loaded", fg="black")
         self.cb_central["values"] = names
+        # replacement dropdown uses the same masters
+        if hasattr(self, "cb_replace_master"):
+            self.cb_replace_master["values"] = names
+            if names:
+                self.cb_replace_master.current(0)
         if names:
             self.cb_central.current(0)
             self._render_shape_data(f"Master: {names[0]}", self.masters_by_name.get(names[0], []))
@@ -356,6 +377,32 @@ class SubstationApp:
             tb = traceback.format_exc()
             print(tb)
             self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+
+    def on_replace_selected(self):
+        # Replace whatever is currently selected in Visio
+        if not self.engine.current_stencil_path:
+            messagebox.showwarning("No stencil", "Load a stencil first.")
+            return
+
+        master = ""
+        if hasattr(self, "cb_replace_master"):
+            master = (self.cb_replace_master.get() or "").strip()
+        if not master:
+            messagebox.showwarning("Select master", "Choose a replacement master.")
+            return
+
+        label = ""
+        if hasattr(self, "entry_replace_label"):
+            label = (self.entry_replace_label.get() or "").strip()
+
+        def _run():
+            try:
+                self.engine.replace_selected_shape(master, label_text=label or None)
+                self.root.after(0, lambda: messagebox.showinfo("Success", "Selected shape replaced."))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def on_close(self):
         try:

@@ -181,6 +181,128 @@ class VisioEngine:
         self._selection_thread = None
 
     # ----------------------------------------------------------
+    # Replace the currently selected Visio shape with another master
+    # from the currently loaded stencil, at the same location.
+    #
+    # - replacement_master_name: master name to drop
+    # - label_text: optional label to draw above the replacement
+    # ----------------------------------------------------------
+    def replace_selected_shape(self, replacement_master_name, label_text=None):
+        pythoncom.CoInitialize()
+        try:
+            if not self.current_stencil_path:
+                raise Exception("Stencil not loaded.")
+
+            app, docs = self._get_visio()
+
+            # Selection
+            window = getattr(app, "ActiveWindow", None)
+            if window is None:
+                raise Exception("No active Visio window.")
+
+            selection = getattr(window, "Selection", None)
+            if selection is None:
+                raise Exception("No selection found in Visio.")
+
+            try:
+                sel_count = int(selection.Count)
+            except Exception:
+                sel_count = 0
+            if sel_count <= 0:
+                raise Exception("Select a shape in Visio first.")
+
+            try:
+                old_shape = selection.Item(1)
+            except Exception:
+                raise Exception("Could not read selected shape.")
+
+            # Read old shape placement (in internal units)
+            try:
+                page = old_shape.ContainingPage
+            except Exception:
+                page = None
+            if page is None:
+                raise Exception("Selected shape has no containing page.")
+
+            def _cell_result_iu(shp, cell_name, default=None):
+                try:
+                    return float(shp.CellsU(cell_name).ResultIU)
+                except Exception:
+                    return default
+
+            x = _cell_result_iu(old_shape, "PinX", 0.0)
+            y = _cell_result_iu(old_shape, "PinY", 0.0)
+            width = _cell_result_iu(old_shape, "Width", None)
+            height = _cell_result_iu(old_shape, "Height", None)
+            angle = _cell_result_iu(old_shape, "Angle", None)
+
+            # Open stencil (copy for safety)
+            base = os.path.basename(self.current_stencil_path)
+            stencil_copy = os.path.join(tempfile.gettempdir(), f"replace_{int(time.time() * 1000)}_{base}")
+            shutil.copy2(self.current_stencil_path, stencil_copy)
+            stencil = docs.OpenEx(stencil_copy, 64)
+
+            try:
+                new_master = None
+                try:
+                    new_master = stencil.Masters.Item(replacement_master_name)
+                except Exception:
+                    for m in stencil.Masters:
+                        try:
+                            if self._normalize(m.Name).lower() == self._normalize(replacement_master_name).lower():
+                                new_master = m
+                                break
+                        except Exception:
+                            continue
+
+                if new_master is None:
+                    raise Exception(f"Replacement master '{replacement_master_name}' not found.")
+
+                # Drop replacement at same location
+                new_shape = page.Drop(new_master, x, y)
+
+                # Preserve basic transforms (best-effort)
+                if width is not None:
+                    try:
+                        new_shape.CellsU("Width").ResultIU = float(width)
+                    except Exception:
+                        pass
+                if height is not None:
+                    try:
+                        new_shape.CellsU("Height").ResultIU = float(height)
+                    except Exception:
+                        pass
+                if angle is not None:
+                    try:
+                        new_shape.CellsU("Angle").ResultIU = float(angle)
+                    except Exception:
+                        pass
+
+                # Delete old shape
+                try:
+                    old_shape.Delete()
+                except Exception:
+                    pass
+
+                # Add/refresh label textbox above the replacement
+                try:
+                    bbox = self._get_shape_bbox(new_shape)
+                    if label_text is None:
+                        label_text = replacement_master_name
+                    label_text = (label_text or "").strip()
+                    if bbox and label_text:
+                        self._place_label_top_left(page, bbox, label_text)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    stencil.Close()
+                except Exception:
+                    pass
+        finally:
+            pythoncom.CoUninitialize()
+
+    # ----------------------------------------------------------
     # Generate the real Visio layout (NO PREVIEW)
     # Adds a small bold label placed top-left of each dropped substation (best-effort)
     # ----------------------------------------------------------
@@ -657,7 +779,9 @@ class VisioEngine:
         rect_bottom = top + gap
         rect_top = rect_bottom + height
 
-        t = page.DrawRectangle(rect_left, rect_top, rect_right, rect_bottom)
+        # Visio expects (x1, y1, x2, y2) as opposite corners;
+        # use (left,bottom,right,top) ordering to avoid inverted boxes.
+        t = page.DrawRectangle(rect_left, rect_bottom, rect_right, rect_top)
         try:
             t.Text = label_text
         except Exception:
@@ -676,6 +800,11 @@ class VisioEngine:
         # Bold + top-left alignment
         try:
             t.CellsU("Char.Bold").FormulaU = "1"
+        except Exception:
+            pass
+        try:
+            # 10 pt is readable; feel free to change
+            t.CellsU("Char.Size").FormulaU = "10 pt"
         except Exception:
             pass
         try:
