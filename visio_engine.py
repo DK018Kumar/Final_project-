@@ -100,6 +100,69 @@ class VisioEngine:
             pythoncom.CoUninitialize()
 
     # ----------------------------------------------------------
+    # Read ShapeSheet "Shape Data" only (Prop section) from a shape.
+    # Returns list of dicts: {"label": <str>, "value": <str>}
+    # ----------------------------------------------------------
+    def get_shape_sheet_shape_data(self, shape):
+        rows = []
+        if shape is None:
+            return rows
+        try:
+            if not shape.SectionExists(constants.visSectionProp, 0):
+                return rows
+        except Exception:
+            return rows
+
+        try:
+            row_count = shape.RowCount(constants.visSectionProp)
+        except Exception:
+            row_count = 0
+
+        for idx in range(int(row_count or 0)):
+            try:
+                row_name = shape.RowNameU(constants.visSectionProp, idx)
+            except Exception:
+                row_name = f"Row_{idx}"
+
+            label = ""
+            value = ""
+
+            try:
+                label = shape.CellsU(f"Prop.{row_name}.Label").ResultStr(0)
+            except Exception:
+                try:
+                    label = shape.CellsU(f"Prop.{row_name}.Prompt").ResultStr(0)
+                except Exception:
+                    label = row_name
+
+            label = (label or row_name or "").strip()
+
+            try:
+                value = shape.CellsU(f"Prop.{row_name}.Value").ResultStr(0)
+            except Exception:
+                try:
+                    value = shape.CellsU(f"Prop.{row_name}").ResultStr(0)
+                except Exception:
+                    value = ""
+
+            rows.append({"label": label, "value": "" if value is None else str(value)})
+
+        # remove empty labels
+        out = []
+        seen = set()
+        for r in rows:
+            lbl = (r.get("label") or "").strip()
+            val = (r.get("value") or "").strip()
+            if not lbl:
+                continue
+            key = (lbl, val)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"label": lbl, "value": val})
+        return out
+
+    # ----------------------------------------------------------
     # Live selection watcher: when user clicks shapes in Visio,
     # call the provided callback with shape + Shape Data.
     #
@@ -500,6 +563,21 @@ class VisioEngine:
             doc = docs.Add("")
             page = doc.Pages(1)
 
+            layout_meta = {
+                "document_name": "",
+                "page_id": None,
+                "central": None,
+                "matrix": [],
+            }
+            try:
+                layout_meta["document_name"] = getattr(doc, "Name", "") or ""
+            except Exception:
+                layout_meta["document_name"] = ""
+            try:
+                layout_meta["page_id"] = int(getattr(page, "ID", 0))
+            except Exception:
+                layout_meta["page_id"] = None
+
             # CONFIGURABLE SPACING
             CENTRAL_X = 10.0
             CENTRAL_Y = 15.0
@@ -535,7 +613,18 @@ class VisioEngine:
                 raise Exception(f"Central master '{central_name}' not found.")
 
             label_text = custom_label if custom_label else central_name
-            self._drop_shape_with_label(page, central_master, CENTRAL_X, CENTRAL_Y, label_text)
+            central_shape = self._drop_shape_with_label(page, central_master, CENTRAL_X, CENTRAL_Y, label_text)
+            if central_shape is not None:
+                try:
+                    layout_meta["central"] = {
+                        "shape_id": int(getattr(central_shape, "ID", 0)),
+                        "page_id": int(getattr(page, "ID", 0)),
+                        "master": central_name,
+                        "label": label_text,
+                        "shape_data": self.get_shape_sheet_shape_data(central_shape),
+                    }
+                except Exception:
+                    layout_meta["central"] = None
 
             # Matrix
             matrix = data.get("matrix_subs", [])
@@ -549,6 +638,7 @@ class VisioEngine:
                 start_x = CENTRAL_X
 
             for r in range(rows):
+                layout_meta["matrix"].append([])
                 y = CENTRAL_Y - FIRST_ROW_OFFSET - r * V_SPACING
                 for c in range(cols):
                     cell = matrix[r][c] if c < len(matrix[r]) else None
@@ -574,6 +664,7 @@ class VisioEngine:
                             cell_name = str(cell).strip()
 
                     if not cell_name or cell_name.lower() == "none":
+                        layout_meta["matrix"][r].append(None)
                         continue
 
                     # find master
@@ -590,11 +681,28 @@ class VisioEngine:
                                 continue
 
                     if m_obj is None:
+                        layout_meta["matrix"][r].append(None)
                         continue
 
                     x = start_x + c * H_SPACING
                     label = cell_label if cell_label else cell_name
-                    self._drop_shape_with_label(page, m_obj, x, y, label)
+                    shp = self._drop_shape_with_label(page, m_obj, x, y, label)
+                    if shp is None:
+                        layout_meta["matrix"][r].append(None)
+                        continue
+
+                    try:
+                        layout_meta["matrix"][r].append(
+                            {
+                                "shape_id": int(getattr(shp, "ID", 0)),
+                                "page_id": int(getattr(page, "ID", 0)),
+                                "master": cell_name,
+                                "label": label,
+                                "shape_data": self.get_shape_sheet_shape_data(shp),
+                            }
+                        )
+                    except Exception:
+                        layout_meta["matrix"][r].append(None)
 
             # Fit view
             try:
@@ -603,6 +711,7 @@ class VisioEngine:
                 pass
 
             stencil.Close()
+            return layout_meta
         finally:
             pythoncom.CoUninitialize()
 
@@ -941,6 +1050,19 @@ class VisioEngine:
             return
 
         left, bottom, right, top = bbox
+        try:
+            left = float(left)
+            bottom = float(bottom)
+            right = float(right)
+            top = float(top)
+        except Exception:
+            return
+
+        # normalize bbox
+        x_min = min(left, right)
+        x_max = max(left, right)
+        y_min = min(bottom, top)
+        y_max = max(bottom, top)
 
         # Place a small label rectangle just above the top-left of the shape.
         # (Top-left alignment, bold text)
@@ -950,14 +1072,18 @@ class VisioEngine:
         # Width based on text length (bounded)
         width = max(1.8, min(6.0, 0.16 * max(1, len(label_text))))
 
-        rect_left = left
+        rect_left = x_min
         rect_right = rect_left + width
-        rect_bottom = top + gap
+        rect_bottom = y_max + gap
         rect_top = rect_bottom + height
 
-        # Visio expects (x1, y1, x2, y2) as opposite corners;
-        # use (left,bottom,right,top) ordering to avoid inverted boxes.
-        t = page.DrawRectangle(rect_left, rect_bottom, rect_right, rect_top)
+        x1 = min(rect_left, rect_right)
+        x2 = max(rect_left, rect_right)
+        y1 = min(rect_bottom, rect_top)
+        y2 = max(rect_bottom, rect_top)
+
+        # Use a real textbox rectangle above the shape
+        t = page.DrawRectangle(x1, y1, x2, y2)
         try:
             t.Text = label_text
         except Exception:
@@ -981,6 +1107,10 @@ class VisioEngine:
         try:
             # 10 pt is readable; feel free to change
             t.CellsU("Char.Size").FormulaU = "10 pt"
+        except Exception:
+            pass
+        try:
+            t.CellsU("Char.Color").FormulaU = "RGB(0,0,0)"
         except Exception:
             pass
         try:

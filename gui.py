@@ -24,6 +24,7 @@ class SubstationApp:
         self.live_visio_preview_enabled = tk.BooleanVar(value=True)
         self._selected_visio_shape_id = None
         self._selected_visio_page_id = None
+        self._replace_target = None  # {"page_id":..., "shape_id":..., "row":..., "col":..., "kind":...}
 
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -71,7 +72,12 @@ class SubstationApp:
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         # Replace selected shape controls (from ANY stencil file on disk)
-        replace_frame = tk.LabelFrame(top, text="Replace (click a shape in Visio → click Shape Data → replace)", padx=8, pady=6)
+        replace_frame = tk.LabelFrame(
+            top,
+            text="Replace target: click a substation's Shape Data panel, then replace",
+            padx=8,
+            pady=6,
+        )
         replace_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
         tk.Label(replace_frame, text="Stencil file:").grid(row=0, column=0, sticky="w")
@@ -87,29 +93,9 @@ class SubstationApp:
         self.entry_replace_label = tk.Entry(replace_frame, width=52)
         self.entry_replace_label.grid(row=2, column=1, sticky="w", padx=(6, 10), pady=(6, 0))
 
-        tk.Button(replace_frame, text="Replace Selected", command=self.on_replace_selected).grid(
+        tk.Button(replace_frame, text="Replace Target", command=self.on_replace_selected).grid(
             row=1, column=2, rowspan=2, padx=(6, 0), sticky="ns"
         )
-
-        # Shape data preview block
-        preview_frame = tk.LabelFrame(self.root, text="Shape Data Preview", padx=10, pady=6)
-        preview_frame.pack(fill="x", padx=10, pady=(0, 6))
-        self.shape_data_title = tk.Label(preview_frame, text="(click a shape in Visio to view its data)", anchor="w")
-        self.shape_data_title.pack(fill="x")
-
-        cols = ("type", "value")
-        self.shape_data_tree = ttk.Treeview(preview_frame, columns=cols, show="headings", height=8)
-        self.shape_data_tree.heading("type", text="Type")
-        self.shape_data_tree.heading("value", text="Value")
-        self.shape_data_tree.column("type", width=280, anchor="w")
-        self.shape_data_tree.column("value", width=640, anchor="w")
-        self.shape_data_tree.pack(side="left", fill="both", expand=True)
-        preview_scroll = tk.Scrollbar(preview_frame, orient="vertical", command=self.shape_data_tree.yview)
-        preview_scroll.pack(side="right", fill="y")
-        self.shape_data_tree.configure(yscrollcommand=preview_scroll.set)
-
-        # Clicking the shape data panel triggers replacement flow for that shape
-        self.shape_data_tree.bind("<Double-1>", lambda e: self.on_replace_selected())
 
         # Scrollable area for matrix
         container = tk.Frame(self.root)
@@ -196,17 +182,8 @@ class SubstationApp:
         self.cb_central["values"] = names
         if names:
             self.cb_central.current(0)
-            self._render_shape_data(f"Master: {names[0]}", self.masters_by_name.get(names[0], []))
         messagebox.showinfo("Success", f"Loaded {len(names)} masters.")
-        if not names:
-            self._render_shape_data("Master: (none)", [])
-
-        # Start live selection tracking (so clicking Visio shapes updates Shape Data)
-        if self.live_visio_preview_enabled.get():
-            try:
-                self.engine.start_selection_watch(self._on_visio_selection_payload)
-            except Exception:
-                pass
+        # Shape Data for each substation is shown inside each matrix cell after generation.
 
     # ------------------------
     # Build matrix UI
@@ -292,32 +269,11 @@ class SubstationApp:
                 label_entry.delete(0, tk.END)
                 label_entry.insert(0, name)
 
-        props = self.masters_by_name.get(name, [])
-        # Store a snapshot so each cell keeps its own data (won't be overwritten)
+        # Do NOT show cached/stencil-internal data here.
+        # The user-facing Shape Data must come from the generated Visio shape's ShapeSheet (Prop rows).
         cell_state["selected_master"] = name
-        cell_state["selected_props"] = copy.deepcopy(props)
-        if not props:
-            tk.Label(props_frame, text="(no shape data found)", fg="gray").pack(anchor="w")
-            return
-
-        # Header row
-        header = tk.Frame(props_frame)
-        header.pack(fill="x", anchor="w")
-        tk.Label(header, text="Type", font=("Arial", 9, "bold")).grid(
-            row=0, column=0, sticky="w", padx=(0, 8)
-        )
-        tk.Label(header, text="Value", font=("Arial", 9, "bold")).grid(row=0, column=1, sticky="w")
-
-        # Each property
-        for p in props:
-            t = p.get("type", "")
-            v = p.get("value", "")
-            row = tk.Frame(props_frame)
-            row.pack(fill="x", anchor="w", pady=1)
-            tk.Label(row, text=t, anchor="w", width=28).grid(row=0, column=0, sticky="w", padx=(0, 8))
-            tk.Label(row, text=v, anchor="w", wraplength=360, justify="left").grid(
-                row=0, column=1, sticky="w"
-            )
+        cell_state["selected_props"] = []
+        tk.Label(props_frame, text="(generate layout to see this shape's ShapeSheet data)", fg="gray").pack(anchor="w")
 
     # ------------------------
     # Generate layout in Visio
@@ -351,61 +307,101 @@ class SubstationApp:
 
     def _on_central_selected(self, event=None):
         name = self.cb_central.get()
-        if name:
-            self._render_shape_data(f"Master: {name}", self.masters_by_name.get(name, []))
+        # Shape Data for the generated central shape is shown in Visio (label above shape).
+        # Per-substation Shape Data panels are rendered in the matrix after generation.
+        _ = name
 
-    def _render_shape_data(self, title, props):
-        if not hasattr(self, "shape_data_tree") or self.shape_data_tree is None:
+    def _set_replace_target(self, cell_state, row_idx=None, col_idx=None):
+        page_id = cell_state.get("visio_page_id")
+        shape_id = cell_state.get("visio_shape_id")
+        if not page_id or not shape_id:
             return
-        if hasattr(self, "shape_data_title") and self.shape_data_title is not None:
-            self.shape_data_title.config(text=title or "Shape Data")
+        self._replace_target = {
+            "page_id": page_id,
+            "shape_id": shape_id,
+            "row": row_idx,
+            "col": col_idx,
+            "kind": "matrix_cell",
+        }
 
-        # Clear
-        for iid in self.shape_data_tree.get_children():
-            self.shape_data_tree.delete(iid)
+    def _render_cell_shape_data(self, cell_state, row_idx, col_idx, shape_data_rows):
+        pf = cell_state["props_frame"]
+        for w in pf.winfo_children():
+            w.destroy()
 
-        if props:
-            for prop in props:
-                t = (prop.get("type", "") or "").strip()
-                v = (prop.get("value", "") or "").strip()
-                self.shape_data_tree.insert("", "end", values=(t, v))
-        else:
-            self.shape_data_tree.insert("", "end", values=("(no shape data)", ""))
+        # Title line (clickable)
+        title = tk.Label(pf, text="Shape Data (click to target replace)", font=("Arial", 9, "bold"))
+        title.pack(anchor="w")
 
-    def _on_visio_selection_payload(self, payload):
-        # Called from a COM event thread; marshal to Tk main thread.
-        try:
-            title = payload.get("title", "Selected: (unknown)")
-            props = payload.get("props", [])
-            shape_id = payload.get("shape_id", None)
-            page_id = payload.get("page_id", None)
-        except Exception:
-            title = "Selected: (unknown)"
-            props = []
-            shape_id = None
-            page_id = None
+        def _select_target(_event=None):
+            self._set_replace_target(cell_state, row_idx=row_idx, col_idx=col_idx)
 
-        def _apply():
-            self._selected_visio_shape_id = shape_id
-            self._selected_visio_page_id = page_id
-            self._render_shape_data(title, props)
+        title.bind("<Button-1>", _select_target)
+        title.bind("<Double-1>", lambda e: self.on_replace_selected())
 
-        self.root.after(0, _apply)
+        if not shape_data_rows:
+            lbl = tk.Label(pf, text="(no ShapeSheet Shape Data rows found)", fg="gray")
+            lbl.pack(anchor="w")
+            lbl.bind("<Button-1>", _select_target)
+            lbl.bind("<Double-1>", lambda e: self.on_replace_selected())
+            return
+
+        header = tk.Frame(pf)
+        header.pack(fill="x", anchor="w")
+        tk.Label(header, text="Label", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        tk.Label(header, text="Value", font=("Arial", 9, "bold")).grid(row=0, column=1, sticky="w")
+
+        for r in shape_data_rows:
+            lbl = (r.get("label") or "").strip()
+            val = (r.get("value") or "").strip()
+            row = tk.Frame(pf)
+            row.pack(fill="x", anchor="w", pady=1)
+            l1 = tk.Label(row, text=lbl, anchor="w", width=18)
+            l1.grid(row=0, column=0, sticky="w", padx=(0, 8))
+            l2 = tk.Label(row, text=val, anchor="w", wraplength=280, justify="left")
+            l2.grid(row=0, column=1, sticky="w")
+
+            for w in (row, l1, l2):
+                w.bind("<Button-1>", _select_target)
+                w.bind("<Double-1>", lambda e: self.on_replace_selected())
 
     def _thread_generate(self, data):
         try:
-            self.engine.generate_layout(data)
+            meta = self.engine.generate_layout(data)
             def _after():
                 messagebox.showinfo("Success", "Visio layout generated!")
-                if self.live_visio_preview_enabled.get():
-                    # Start live preview: click shapes in Visio to see their data here.
-                    self.engine.start_selection_watch(self._on_visio_selection_payload)
+                try:
+                    self._apply_layout_meta(meta)
+                except Exception:
+                    pass
 
             self.root.after(0, _after)
         except Exception as e:
             tb = traceback.format_exc()
             print(tb)
             self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+
+    def _apply_layout_meta(self, meta):
+        matrix = (meta or {}).get("matrix", [])
+        for r, row in enumerate(self.matrix_widgets):
+            for c, cell_state in enumerate(row):
+                info = None
+                try:
+                    info = matrix[r][c]
+                except Exception:
+                    info = None
+
+                if info and isinstance(info, dict):
+                    cell_state["visio_shape_id"] = info.get("shape_id")
+                    cell_state["visio_page_id"] = info.get("page_id")
+                    self._render_cell_shape_data(cell_state, r, c, info.get("shape_data", []))
+                else:
+                    cell_state["visio_shape_id"] = None
+                    cell_state["visio_page_id"] = None
+                    pf = cell_state["props_frame"]
+                    for w in pf.winfo_children():
+                        w.destroy()
+                    tk.Label(pf, text="(empty)", fg="gray").pack(anchor="w")
 
     def on_browse_replace_stencil(self):
         path = filedialog.askopenfilename(filetypes=[("Visio Stencil", "*.vssx *.vss *.vstx")])
@@ -429,11 +425,15 @@ class SubstationApp:
             self.cb_replace_master.current(0)
 
     def on_replace_selected(self):
-        # Replace the shape whose Shape Data is currently displayed (Visio selection)
-        page_id = self._selected_visio_page_id
-        shape_id = self._selected_visio_shape_id
+        # Replace the shape whose per-cell Shape Data panel you clicked
+        if not self._replace_target:
+            messagebox.showwarning("Select target", "Click a substation's Shape Data panel first to select the target.")
+            return
+
+        page_id = self._replace_target.get("page_id")
+        shape_id = self._replace_target.get("shape_id")
         if not page_id or not shape_id:
-            messagebox.showwarning("Select shape", "Click a shape in Visio first so its Shape Data appears here.")
+            messagebox.showwarning("Select target", "Target is missing Visio IDs. Generate the layout again.")
             return
 
         stencil_path = (self.entry_replace_stencil.get() or "").strip()
