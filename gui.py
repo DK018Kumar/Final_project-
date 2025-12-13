@@ -349,17 +349,13 @@ class SubstationApp:
             if type_counts.get(tv, 0) > 1:
                 suffix = f" ({type_seen[tv]})"
 
-            block = tk.LabelFrame(pf, text=f"{tv}{suffix}", padx=6, pady=4)
+            # IMPORTANT: do NOT use LabelFrame text=... because its title area is not a normal Tk widget
+            # and often won't fire our bindings when the user clicks it.
+            block = tk.Frame(pf, relief="groove", bd=1, padx=6, pady=4)
             block.pack(fill="x", anchor="w", pady=(6, 0))
 
-            # Click anywhere in this block to act on THIS element only.
-            def _bind_click(w, part=p):
-                try:
-                    w.bind("<Button-1>", lambda _e, cs=cell_state, prt=part: self._open_part_actions(cs, prt))
-                except Exception:
-                    pass
-
-            _bind_click(block)
+            header_lbl = tk.Label(block, text=f"{tv}{suffix}", font=("Arial", 9, "bold"), anchor="w")
+            header_lbl.pack(fill="x", anchor="w", pady=(0, 4))
 
             if not sd:
                 tk.Label(block, text="(no Prop rows)", fg="gray").pack(anchor="w")
@@ -367,9 +363,10 @@ class SubstationApp:
 
             header = tk.Frame(block)
             header.pack(fill="x", anchor="w")
-            tk.Label(header, text="Label", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
-            tk.Label(header, text="Value", font=("Arial", 9, "bold")).grid(row=0, column=1, sticky="w")
-            _bind_click(header)
+            h1 = tk.Label(header, text="Label", font=("Arial", 9, "bold"))
+            h1.grid(row=0, column=0, sticky="w", padx=(0, 8))
+            h2 = tk.Label(header, text="Value", font=("Arial", 9, "bold"))
+            h2.grid(row=0, column=1, sticky="w")
 
             for _row_name, row_dict in sd.items():
                 # Avoid duplicating the element identifier row in the details list.
@@ -386,9 +383,58 @@ class SubstationApp:
                 l1.grid(row=0, column=0, sticky="w", padx=(0, 8))
                 l2 = tk.Label(row, text=val, anchor="w", wraplength=280, justify="left")
                 l2.grid(row=0, column=1, sticky="w")
-                _bind_click(row)
-                _bind_click(l1)
-                _bind_click(l2)
+
+                # Make the data area clickable for actions on this element.
+                self._make_part_clickable(block, cell_state, p)
+                self._make_part_clickable(header_lbl, cell_state, p)
+                self._make_part_clickable(header, cell_state, p)
+                self._make_part_clickable(h1, cell_state, p)
+                self._make_part_clickable(h2, cell_state, p)
+                self._make_part_clickable(row, cell_state, p)
+                self._make_part_clickable(l1, cell_state, p)
+                self._make_part_clickable(l2, cell_state, p)
+
+            # Also allow clicking header when there are zero displayed rows (all empty/hidden)
+            self._make_part_clickable(block, cell_state, p)
+            self._make_part_clickable(header_lbl, cell_state, p)
+            self._make_part_clickable(header, cell_state, p)
+            self._make_part_clickable(h1, cell_state, p)
+            self._make_part_clickable(h2, cell_state, p)
+
+    def _make_part_clickable(self, widget, cell_state, part):
+        """
+        Bind clicks reliably and surface errors as tracebacks (so clicks never fail silently).
+        """
+        if widget is None:
+            return
+        try:
+            widget.configure(cursor="hand2")
+        except Exception:
+            pass
+        try:
+            widget.bind(
+                "<ButtonRelease-1>",
+                lambda _e, cs=cell_state, prt=part: self._safe_open_part_actions(cs, prt),
+                add="+",
+            )
+            widget.bind(
+                "<Double-Button-1>",
+                lambda _e, cs=cell_state, prt=part: self._safe_open_part_actions(cs, prt),
+                add="+",
+            )
+        except Exception:
+            pass
+
+    def _safe_open_part_actions(self, cell_state, part):
+        try:
+            self._open_part_actions(cell_state, part)
+        except Exception:
+            tb = traceback.format_exc()
+            try:
+                print(tb, file=sys.stderr)
+            except Exception:
+                pass
+            messagebox.showerror("Click handler error", tb)
 
     def _open_part_actions(self, cell_state, part):
         """
