@@ -1,0 +1,817 @@
+import sys
+import threading
+import traceback
+import tkinter as tk
+import time
+from tkinter import filedialog, messagebox, ttk
+
+import visio_engine
+
+
+class SubstationApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Substation Layout Generator")
+        self.root.geometry("1000x750")
+
+        self.engine = visio_engine.VisioEngine()
+        # list of dicts {'name':..., 'props':[...] }
+        self.loaded_masters = []
+        # lookup name -> (unused) shape_data list; we keep keys for selection
+        self.masters_by_name = {}
+        # matrix structure holds rows of dicts {'combobox':..., 'props_frame':...}
+        self.matrix_widgets = []
+        self._central_visio = None  # {"page_id":..., "shape_id":...} set after generation
+        self._generated_doc_name = None
+
+        self.setup_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def setup_ui(self):
+        # Top controls frame
+        top = tk.Frame(self.root, padx=10, pady=10)
+        top.pack(fill="x")
+
+        tk.Button(top, text="Select Stencil", command=self.on_select_stencil).grid(
+            row=0, column=0, sticky="w"
+        )
+        self.lbl_stencil = tk.Label(top, text="No stencil selected", fg="gray")
+        self.lbl_stencil.grid(row=0, column=1, sticky="w", padx=10)
+
+        tk.Label(top, text="Central Substation:").grid(row=1, column=0, sticky="w", pady=8)
+        self.cb_central = ttk.Combobox(top, state="readonly", width=60)
+        self.cb_central.grid(row=1, column=1, sticky="w", padx=6)
+        self.cb_central.bind("<<ComboboxSelected>>", self._on_central_selected)
+
+        tk.Label(top, text="Central Label:").grid(row=2, column=0, sticky="w")
+        self.entry_central_label = tk.Entry(top, width=40)
+        self.entry_central_label.grid(row=2, column=1, sticky="w", padx=6, pady=(0, 8))
+
+        tk.Label(top, text="Rows:").grid(row=3, column=0, sticky="w")
+        self.entry_rows = tk.Entry(top, width=6)
+        self.entry_rows.insert(0, "2")
+        self.entry_rows.grid(row=3, column=1, sticky="w")
+
+        tk.Label(top, text="Cols:").grid(row=3, column=1, sticky="e", padx=(0, 160))
+        self.entry_cols = tk.Entry(top, width=6)
+        self.entry_cols.insert(0, "3")
+        self.entry_cols.grid(row=3, column=1, sticky="e", padx=(0, 60))
+
+        tk.Button(top, text="Build Matrix", command=self.build_matrix).grid(row=3, column=2, padx=10)
+        tk.Button(top, text="Generate Visio Layout", bg="green", fg="white", command=self.on_generate).grid(
+            row=4, column=0, columnspan=3, pady=12, sticky="ew"
+        )
+
+        # Scrollable area for matrix
+        container = tk.Frame(self.root)
+        container.pack(fill="both", expand=True, padx=10, pady=6)
+
+        # Canvas for scrolling
+        self.canvas = tk.Canvas(container, borderwidth=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        # Scrollbars
+        v_scroll = tk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
+        v_scroll.pack(side="right", fill="y")
+        h_scroll = tk.Scrollbar(self.root, orient="horizontal", command=self.canvas.xview)
+        h_scroll.pack(side="bottom", fill="x")
+
+        self.canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+
+        # Frame inside canvas
+        self.matrix_frame = tk.Frame(self.canvas)
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.matrix_frame, anchor="nw")
+
+        # Bind events for scrolling region updates and mousewheel
+        self.matrix_frame.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Mousewheel support (Windows, Mac, Linux)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel_windows)  # Windows
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel_unix)  # Linux scroll up
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel_unix)  # Linux scroll down
+
+    def _on_frame_configure(self, event):
+        # update scrollregion to include new size
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_canvas_configure(self, event):
+        # match inner frame width optionally
+        try:
+            self.canvas.itemconfig(self.canvas_window, width=event.width)
+        except Exception:
+            pass
+
+    def _on_mousewheel_windows(self, event):
+        # For vertical scrolling; event.delta is multiple of 120 on Windows
+        try:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except Exception:
+            pass
+
+    def _on_mousewheel_unix(self, event):
+        # For some Linux setups using Button-4/5
+        try:
+            if event.num == 4:
+                self.canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                self.canvas.yview_scroll(1, "units")
+        except Exception:
+            pass
+
+    # ------------------------
+    # Stencil loading
+    # ------------------------
+    def on_select_stencil(self):
+        path = filedialog.askopenfilename(filetypes=[("Visio Stencil", "*.vssx *.vss *.vstx")])
+        if not path:
+            return
+        threading.Thread(target=self._thread_load_stencil, args=(path,), daemon=True).start()
+
+    def _thread_load_stencil(self, path):
+        try:
+            masters = self.engine.load_stencil_masters(path)
+            self.root.after(0, lambda: self._after_load_stencil(masters))
+        except Exception as e:
+            tb = traceback.format_exc()
+            # Ensure the real COM/Visio error is visible
+            try:
+                print(tb, file=sys.stderr)
+            except Exception:
+                pass
+            self.root.after(0, lambda: messagebox.showerror("Error", tb))
+
+    def _after_load_stencil(self, masters):
+        # masters: list of dicts {'name':..., 'shape_data': [...]}
+        self.loaded_masters = masters
+        # Keep ONLY master names for selection; do not display master shape data anywhere.
+        self.masters_by_name = {m["name"]: [] for m in masters}
+        names = list(self.masters_by_name.keys())
+        self.lbl_stencil.config(text="Stencil Loaded", fg="black")
+        self.cb_central["values"] = names
+        if names:
+            self.cb_central.current(0)
+        messagebox.showinfo("Success", f"Loaded {len(names)} masters.")
+        # Matrix cell Shape Data is shown per-cell, based on selected master and/or generated shape.
+
+    # ------------------------
+    # Build matrix UI
+    # ------------------------
+    def build_matrix(self):
+        # destroy previous widgets
+        for w in self.matrix_frame.winfo_children():
+            w.destroy()
+        self.matrix_widgets = []
+
+        try:
+            rows = int(self.entry_rows.get())
+            cols = int(self.entry_cols.get())
+            if rows <= 0 or cols <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Error", "Rows and Cols must be positive integers.")
+            return
+
+        # Build grid: each cell is a small frame with combobox + props below
+        for r in range(rows):
+            row_container = tk.Frame(self.matrix_frame)
+            row_container.grid(row=r, column=0, sticky="w", pady=6)
+
+            row_widgets = []
+            for c in range(cols):
+                cell_frame = tk.Frame(row_container, relief="ridge", bd=1, padx=6, pady=6)
+                cell_frame.pack(side="left", padx=8, pady=4)
+
+                tk.Label(cell_frame, text=f"({r},{c})", anchor="w").pack(anchor="w")
+
+                cb = ttk.Combobox(
+                    cell_frame,
+                    state="readonly",
+                    width=36,
+                    values=["None"] + list(self.masters_by_name.keys()),
+                )
+                cb.pack(anchor="w", pady=(4, 2))
+                cb.current(0)
+
+                tk.Label(cell_frame, text="Custom Label:", anchor="w").pack(anchor="w")
+                entry_label = tk.Entry(cell_frame, width=34)
+                entry_label.pack(anchor="w", pady=(0, 4))
+
+                props_frame = tk.Frame(cell_frame)
+                props_frame.pack(anchor="w", fill="x", pady=(4, 0))
+
+                cell_state = {
+                    "combobox": cb,
+                    "props_frame": props_frame,
+                    "label_entry": entry_label,
+                    "selected_master": None,
+                    "selected_props": [],
+                }
+
+                # bind selection event (store props on the cell itself)
+                cb.bind("<<ComboboxSelected>>", lambda e, cs=cell_state: self._on_master_selected(cs))
+
+                row_widgets.append(cell_state)
+            self.matrix_widgets.append(row_widgets)
+
+        # update scroll region
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_master_selected(self, cell_state):
+        combobox = cell_state["combobox"]
+        props_frame = cell_state["props_frame"]
+        label_entry = cell_state.get("label_entry")
+
+        # clear existing children
+        for w in props_frame.winfo_children():
+            w.destroy()
+
+        name = combobox.get()
+        if not name or name == "None":
+            cell_state["selected_master"] = None
+            cell_state["selected_props"] = []
+            return
+
+        if label_entry is not None:
+            current_text = label_entry.get().strip()
+            if not current_text:
+                label_entry.delete(0, tk.END)
+                label_entry.insert(0, name)
+
+        cell_state["selected_master"] = name
+        cell_state["selected_props"] = []
+        # Do NOT show master-based data. We'll show per-substation (dropped) shape data after generation.
+        tk.Label(props_frame, text="(generate layout to view Shape Data for this substation)", fg="gray").pack(anchor="w")
+
+    # ------------------------
+    # Generate layout in Visio
+    # ------------------------
+    def on_generate(self):
+        if not self.engine.current_stencil_path:
+            messagebox.showwarning("No stencil", "Load a stencil first.")
+            return
+
+        central = self.cb_central.get()
+        if not central:
+            messagebox.showwarning("Select Central", "Choose a central substation.")
+            return
+
+        matrix = []
+        for row in self.matrix_widgets:
+            row_data = []
+            for cell in row:
+                row_data.append({"name": cell["combobox"].get(), "label": cell["label_entry"].get().strip()})
+            matrix.append(row_data)
+
+        central_label = self.entry_central_label.get().strip()
+        data = {
+            "central": central,
+            "matrix_subs": matrix,
+            "central_label": central_label,
+            # maintain legacy key name for engine compatibility
+            "substation_label": central_label,
+        }
+        threading.Thread(target=self._thread_generate, args=(data,), daemon=True).start()
+
+    def _on_central_selected(self, event=None):
+        # No central/global shape-data panels; per-substation only.
+        return
+
+    def _render_cell_shape_data(self, cell_state, row_idx, col_idx, shape_data_rows, show_replace_button):
+        pf = cell_state["props_frame"]
+        for w in pf.winfo_children():
+            w.destroy()
+
+        # shape_data_rows here is expected to be:
+        #   {"parts": [ {page_id, shape_id, type_value, shape_data}, ... ] }
+        # or a legacy list/dict for a single shape.
+
+        title = tk.Label(pf, text="Shape Data", font=("Arial", 9, "bold"))
+        title.pack(anchor="w")
+
+        parts = None
+        if isinstance(shape_data_rows, dict) and "parts" in shape_data_rows:
+            parts = shape_data_rows.get("parts") or []
+
+        if parts is None:
+            # legacy single-shape rendering
+            if show_replace_button:
+                actions = tk.Frame(pf)
+                actions.pack(anchor="w", pady=(4, 4))
+                tk.Button(actions, text="Replace…", command=lambda: self._replace_via_dialog(cell_state)).pack(side="left")
+                tk.Button(actions, text="Delete", command=lambda: self._delete_shape(cell_state)).pack(side="left", padx=(8, 0))
+
+            if not shape_data_rows:
+                tk.Label(pf, text="(no ShapeSheet Shape Data rows found)", fg="gray").pack(anchor="w")
+                return
+
+            header = tk.Frame(pf)
+            header.pack(fill="x", anchor="w")
+            tk.Label(header, text="Label", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+            tk.Label(header, text="Value", font=("Arial", 9, "bold")).grid(row=0, column=1, sticky="w")
+
+            if isinstance(shape_data_rows, dict):
+                iterable = list(shape_data_rows.values())
+            else:
+                iterable = shape_data_rows
+
+            for r in iterable:
+                lbl = (r.get("label") or "").strip()
+                val = (r.get("value") or "").strip()
+                row = tk.Frame(pf)
+                row.pack(fill="x", anchor="w", pady=1)
+                tk.Label(row, text=lbl, anchor="w", width=18).grid(row=0, column=0, sticky="w", padx=(0, 8))
+                tk.Label(row, text=val, anchor="w", wraplength=280, justify="left").grid(row=0, column=1, sticky="w")
+            return
+
+        # New: render internal typed shapes for this substation. Replace/Delete targets the specific object only.
+        if not parts:
+            tk.Label(pf, text="(no internal shapes found with Prop.TYPE.Value)", fg="gray").pack(anchor="w")
+            return
+
+        # Disambiguate duplicates of TYPE by adding an index, but still show TYPE text.
+        type_counts = {}
+        for p in parts:
+            tv = (p.get("type_value") or "").strip()
+            type_counts[tv] = type_counts.get(tv, 0) + 1
+        type_seen = {}
+
+        for p in parts:
+            tv = (p.get("type_value") or "").strip()
+            sd = p.get("shape_data") or {}
+            page_id = p.get("page_id")
+            shape_id = p.get("shape_id")
+
+            type_seen[tv] = type_seen.get(tv, 0) + 1
+            suffix = ""
+            if type_counts.get(tv, 0) > 1:
+                suffix = f" ({type_seen[tv]})"
+
+            # IMPORTANT: do NOT use LabelFrame text=... because its title area is not a normal Tk widget
+            # and often won't fire our bindings when the user clicks it.
+            block = tk.Frame(pf, relief="groove", bd=1, padx=6, pady=4)
+            block.pack(fill="x", anchor="w", pady=(6, 0))
+
+            header_row = tk.Frame(block)
+            header_row.pack(fill="x", anchor="w", pady=(0, 4))
+
+            header_lbl = tk.Label(header_row, text=f"{tv}{suffix}", font=("Arial", 9, "bold"), anchor="w")
+            header_lbl.pack(side="left", fill="x", expand=True)
+
+            # Always provide explicit buttons (mouse bindings can be blocked by focus/overlays on some systems).
+            btn_replace = tk.Button(
+                header_row,
+                text="Replace…",
+                command=lambda cs=cell_state, prt=p: self._replace_part_via_dialog(cs, prt),
+            )
+            btn_replace.pack(side="left", padx=(8, 0))
+            btn_delete = tk.Button(
+                header_row,
+                text="Delete",
+                command=lambda cs=cell_state, prt=p: self._delete_part(cs, prt),
+            )
+            btn_delete.pack(side="left", padx=(6, 0))
+
+            if not sd:
+                tk.Label(block, text="(no Prop rows)", fg="gray").pack(anchor="w")
+                continue
+
+            header = tk.Frame(block)
+            header.pack(fill="x", anchor="w")
+            h1 = tk.Label(header, text="Label", font=("Arial", 9, "bold"))
+            h1.grid(row=0, column=0, sticky="w", padx=(0, 8))
+            h2 = tk.Label(header, text="Value", font=("Arial", 9, "bold"))
+            h2.grid(row=0, column=1, sticky="w")
+
+            for _row_name, row_dict in sd.items():
+                # Avoid duplicating the element identifier row in the details list.
+                if str(_row_name).strip().upper() == "TYPE":
+                    continue
+                lbl = (row_dict.get("label") or "").strip()
+                val = (row_dict.get("value") or "").strip()
+                # Hide empty rows to reduce noise
+                if not lbl and not val:
+                    continue
+                row = tk.Frame(block)
+                row.pack(fill="x", anchor="w", pady=1)
+                l1 = tk.Label(row, text=lbl, anchor="w", width=18)
+                l1.grid(row=0, column=0, sticky="w", padx=(0, 8))
+                l2 = tk.Label(row, text=val, anchor="w", wraplength=280, justify="left")
+                l2.grid(row=0, column=1, sticky="w")
+
+                # Make the data area clickable for actions on this element.
+                self._make_part_clickable(block, cell_state, p)
+                self._make_part_clickable(header_row, cell_state, p)
+                self._make_part_clickable(header_lbl, cell_state, p)
+                # Keep buttons clickable as buttons; do not bind click-to-action on them
+                self._make_part_clickable(header, cell_state, p)
+                self._make_part_clickable(h1, cell_state, p)
+                self._make_part_clickable(h2, cell_state, p)
+                self._make_part_clickable(row, cell_state, p)
+                self._make_part_clickable(l1, cell_state, p)
+                self._make_part_clickable(l2, cell_state, p)
+
+            # Also allow clicking header when there are zero displayed rows (all empty/hidden)
+            self._make_part_clickable(block, cell_state, p)
+            self._make_part_clickable(header_row, cell_state, p)
+            self._make_part_clickable(header_lbl, cell_state, p)
+            self._make_part_clickable(header, cell_state, p)
+            self._make_part_clickable(h1, cell_state, p)
+            self._make_part_clickable(h2, cell_state, p)
+
+    def _make_part_clickable(self, widget, cell_state, part):
+        """
+        Bind clicks reliably and surface errors as tracebacks (so clicks never fail silently).
+        """
+        if widget is None:
+            return
+        try:
+            widget.configure(cursor="hand2")
+        except Exception:
+            pass
+        try:
+            widget.bind(
+                "<Button-1>",
+                lambda _e, cs=cell_state, prt=part: self._safe_open_part_actions(cs, prt),
+                add="+",
+            )
+            widget.bind(
+                "<ButtonRelease-1>",
+                lambda _e, cs=cell_state, prt=part: self._safe_open_part_actions(cs, prt),
+                add="+",
+            )
+            widget.bind(
+                "<Double-Button-1>",
+                lambda _e, cs=cell_state, prt=part: self._safe_open_part_actions(cs, prt),
+                add="+",
+            )
+        except Exception:
+            pass
+
+    def _safe_open_part_actions(self, cell_state, part):
+        try:
+            self._open_part_actions(cell_state, part)
+        except Exception:
+            tb = traceback.format_exc()
+            try:
+                print(tb, file=sys.stderr)
+            except Exception:
+                pass
+            messagebox.showerror("Click handler error", tb)
+
+    def _open_part_actions(self, cell_state, part):
+        """
+        Single-click action chooser for an internal element (identified by Prop.TYPE.Value).
+        Replaces/deletes ONLY that element, not the whole stencil/substation.
+        """
+        tv = (part.get("type_value") or "").strip() or "(unknown TYPE)"
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Element actions: {tv}")
+        dlg.transient(self.root)
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+
+        tk.Label(
+            dlg,
+            text=f"Selected element (Prop.TYPE.Value):\n{tv}\n\nChoose an action for ONLY this element:",
+            justify="left",
+            padx=10,
+            pady=10,
+        ).pack(anchor="w")
+
+        btns = tk.Frame(dlg, padx=10, pady=10)
+        btns.pack(anchor="w")
+
+        def _do_replace():
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+            self._replace_part_via_dialog(cell_state, part)
+
+        def _do_delete():
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+            self._delete_part(cell_state, part)
+
+        tk.Button(btns, text="Replace…", command=_do_replace).pack(side="left")
+        tk.Button(btns, text="Delete", command=_do_delete).pack(side="left", padx=(10, 0))
+        tk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=(10, 0))
+
+    def _delete_part(self, cell_state, part):
+        page_id = part.get("page_id")
+        shape_id = part.get("shape_id")
+        if not page_id or not shape_id:
+            return
+        if not messagebox.askyesno("Confirm delete", "Delete this object from the substation?"):
+            return
+
+        def _run():
+            try:
+                doc_name = cell_state.get("visio_document_name") or self._generated_doc_name
+                self.engine.delete_shape_by_id(page_id, shape_id, document_name=doc_name)
+
+                def _after():
+                    parts = (cell_state.get("parts") or [])
+                    cell_state["parts"] = [p for p in parts if p.get("shape_id") != shape_id or p.get("page_id") != page_id]
+                    self._render_cell_shape_data(cell_state, None, None, {"parts": cell_state.get("parts") or []}, show_replace_button=True)
+                    messagebox.showinfo("Deleted", "Object deleted.")
+
+                self.root.after(0, _after)
+            except Exception:
+                tb = traceback.format_exc()
+                self.root.after(0, lambda: messagebox.showerror("Error", tb))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _replace_part_via_dialog(self, cell_state, part):
+        page_id = part.get("page_id")
+        shape_id = part.get("shape_id")
+        if not page_id or not shape_id:
+            return
+
+        stencil_path = filedialog.askopenfilename(filetypes=[("Visio Stencil", "*.vssx *.vss *.vstx")])
+        if not stencil_path:
+            return
+
+        def _run():
+            try:
+                masters = self.engine.get_stencil_master_names(stencil_path)
+                if not masters:
+                    raise Exception("No masters found in selected stencil.")
+
+                if len(masters) == 1:
+                    chosen = masters[0]
+                else:
+                    chosen_holder = {"val": None}
+
+                    def _ask():
+                        dlg = tk.Toplevel(self.root)
+                        dlg.title("Choose replacement master")
+                        tk.Label(dlg, text="Select master to replace with:").pack(anchor="w", padx=10, pady=(10, 4))
+                        cb = ttk.Combobox(dlg, state="readonly", values=masters, width=60)
+                        cb.pack(padx=10, pady=(0, 10))
+                        cb.current(0)
+
+                        def _ok():
+                            chosen_holder["val"] = cb.get()
+                            dlg.destroy()
+
+                        tk.Button(dlg, text="OK", command=_ok).pack(pady=(0, 10))
+                        dlg.transient(self.root)
+                        dlg.grab_set()
+                        self.root.wait_window(dlg)
+
+                    self.root.after(0, _ask)
+                    for _ in range(600):
+                        if chosen_holder["val"] is not None:
+                            break
+                        time.sleep(0.05)
+                    chosen = chosen_holder["val"]
+
+                if not chosen:
+                    return
+
+                # Replace only the clicked object. Keep the substation label as-is (we don't re-label on part replacement).
+                doc_name = cell_state.get("visio_document_name") or self._generated_doc_name
+                result = self.engine.replace_shape_by_id(
+                    page_id=page_id,
+                    shape_id=shape_id,
+                    stencil_path=stencil_path,
+                    replacement_master_name=chosen,
+                    label_text=None,
+                    document_name=doc_name,
+                )
+
+                def _after():
+                    if not isinstance(result, dict):
+                        return
+
+                    # result may be a single shape or a grouped replacement (parts)
+                    new_parts = result.get("parts")
+                    if not new_parts:
+                        new_parts = [
+                            {
+                                "page_id": result.get("page_id"),
+                                "shape_id": result.get("shape_id"),
+                                "type_value": result.get("type_value"),
+                                "shape_data": result.get("shape_data") or {},
+                            }
+                        ]
+
+                    old_parts = cell_state.get("parts") or []
+                    replaced = []
+                    for p in old_parts:
+                        if p.get("page_id") == page_id and p.get("shape_id") == shape_id:
+                            replaced.extend(new_parts)
+                        else:
+                            replaced.append(p)
+                    cell_state["parts"] = replaced
+                    self._render_cell_shape_data(cell_state, None, None, {"parts": replaced}, show_replace_button=True)
+                    messagebox.showinfo("Success", "Object replaced.")
+
+                self.root.after(0, _after)
+            except Exception:
+                tb = traceback.format_exc()
+                try:
+                    print(tb, file=sys.stderr)
+                except Exception:
+                    pass
+                self.root.after(0, lambda: messagebox.showerror("Error", tb))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _delete_shape(self, cell_state):
+        page_id = cell_state.get("visio_page_id")
+        shape_id = cell_state.get("visio_shape_id")
+        if not page_id or not shape_id:
+            messagebox.showwarning("Not generated", "Generate the Visio layout first, then you can delete shapes.")
+            return
+
+        if not messagebox.askyesno("Confirm delete", "Delete this shape from Visio?"):
+            return
+
+        def _run():
+            try:
+                doc_name = cell_state.get("visio_document_name") or self._generated_doc_name
+                self.engine.delete_shape_by_id(page_id, shape_id, document_name=doc_name)
+
+                def _after():
+                    cell_state["visio_page_id"] = None
+                    cell_state["visio_shape_id"] = None
+                    pf = cell_state["props_frame"]
+                    for w in pf.winfo_children():
+                        w.destroy()
+                    tk.Label(pf, text="(deleted)", fg="gray").pack(anchor="w")
+                    messagebox.showinfo("Deleted", "Shape deleted.")
+
+                self.root.after(0, _after)
+            except Exception:
+                tb = traceback.format_exc()
+                self.root.after(0, lambda: messagebox.showerror("Error", tb))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _thread_generate(self, data):
+        try:
+            meta = self.engine.generate_layout(data)
+            def _after():
+                messagebox.showinfo("Success", "Visio layout generated!")
+                try:
+                    self._apply_layout_meta(meta)
+                except Exception:
+                    pass
+
+            self.root.after(0, _after)
+        except Exception as e:
+            tb = traceback.format_exc()
+            try:
+                print(tb, file=sys.stderr)
+            except Exception:
+                pass
+            self.root.after(0, lambda: messagebox.showerror("Error", tb))
+
+    def _apply_layout_meta(self, meta):
+        matrix = (meta or {}).get("matrix", [])
+        central = (meta or {}).get("central")
+        self._generated_doc_name = (meta or {}).get("document_name") or None
+        if isinstance(central, dict):
+            self._central_visio = {"page_id": central.get("page_id"), "shape_id": central.get("shape_id")}
+        for r, row in enumerate(self.matrix_widgets):
+            for c, cell_state in enumerate(row):
+                info = None
+                try:
+                    info = matrix[r][c]
+                except Exception:
+                    info = None
+
+                if info and isinstance(info, dict):
+                    cell_state["visio_shape_id"] = info.get("shape_id")
+                    cell_state["visio_page_id"] = info.get("page_id")
+                    cell_state["visio_document_name"] = self._generated_doc_name
+                    parts = info.get("parts") or []
+                    cell_state["parts"] = parts
+                    # show ShapeSheet data for internal typed shapes and enable Replace/Delete per object
+                    self._render_cell_shape_data(cell_state, r, c, {"parts": parts}, show_replace_button=True)
+                else:
+                    cell_state["visio_shape_id"] = None
+                    cell_state["visio_page_id"] = None
+                    cell_state["visio_document_name"] = self._generated_doc_name
+                    cell_state["parts"] = []
+                    pf = cell_state["props_frame"]
+                    for w in pf.winfo_children():
+                        w.destroy()
+                    tk.Label(pf, text="(empty)", fg="gray").pack(anchor="w")
+
+    def _replace_via_dialog(self, cell_state):
+        # Must have a generated Visio shape to replace
+        page_id = cell_state.get("visio_page_id")
+        shape_id = cell_state.get("visio_shape_id")
+        if not page_id or not shape_id:
+            messagebox.showwarning("Not generated", "Generate the Visio layout first, then you can replace shapes.")
+            return
+
+        stencil_path = filedialog.askopenfilename(filetypes=[("Visio Stencil", "*.vssx *.vss *.vstx")])
+        if not stencil_path:
+            return
+
+        def _run():
+            try:
+                masters = self.engine.get_stencil_master_names(stencil_path)
+                if not masters:
+                    raise Exception("No masters found in selected stencil.")
+
+                # If only one master, use it automatically. Otherwise ask user.
+                if len(masters) == 1:
+                    chosen = masters[0]
+                else:
+                    chosen = None
+
+                    def _ask():
+                        dlg = tk.Toplevel(self.root)
+                        dlg.title("Choose replacement master")
+                        tk.Label(dlg, text="Select master to replace with:").pack(anchor="w", padx=10, pady=(10, 4))
+                        cb = ttk.Combobox(dlg, state="readonly", values=masters, width=60)
+                        cb.pack(padx=10, pady=(0, 10))
+                        cb.current(0)
+
+                        result = {"val": None}
+
+                        def _ok():
+                            result["val"] = cb.get()
+                            dlg.destroy()
+
+                        tk.Button(dlg, text="OK", command=_ok).pack(pady=(0, 10))
+                        dlg.transient(self.root)
+                        dlg.grab_set()
+                        self.root.wait_window(dlg)
+                        return result["val"]
+
+                    chosen = self.root.after(0, lambda: None)  # placeholder
+                    # marshal dialog to main thread
+                    chosen_holder = {"val": None}
+
+                    def _run_dialog():
+                        chosen_holder["val"] = _ask()
+
+                    self.root.after(0, _run_dialog)
+                    # wait a bit for dialog completion (best-effort)
+                    # We can't block Tk thread here; just poll.
+                    for _ in range(600):
+                        if chosen_holder["val"] is not None:
+                            break
+                        time.sleep(0.05)
+                    chosen = chosen_holder["val"]
+
+                if not chosen:
+                    return
+
+                label = (cell_state.get("label_entry").get() or "").strip() if cell_state.get("label_entry") else ""
+                doc_name = cell_state.get("visio_document_name") or self._generated_doc_name
+                result = self.engine.replace_shape_by_id(
+                    page_id=page_id,
+                    shape_id=shape_id,
+                    stencil_path=stencil_path,
+                    replacement_master_name=chosen,
+                    label_text=label or None,
+                    document_name=doc_name,
+                )
+                def _after():
+                    if isinstance(result, dict):
+                        cell_state["visio_page_id"] = result.get("page_id")
+                        cell_state["visio_shape_id"] = result.get("shape_id")
+                        self._render_cell_shape_data(
+                            cell_state,
+                            row_idx=None,
+                            col_idx=None,
+                            shape_data_rows=result.get("shape_data", {}),
+                            show_replace_button=True,
+                        )
+                    messagebox.showinfo("Success", "Shape replaced.")
+
+                self.root.after(0, _after)
+            except Exception as e:
+                tb = traceback.format_exc()
+                try:
+                    print(tb, file=sys.stderr)
+                except Exception:
+                    pass
+                self.root.after(0, lambda: messagebox.showerror("Error", tb))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def on_close(self):
+        try:
+            self.engine.stop_selection_watch()
+        except Exception:
+            pass
+        self.root.destroy()
+        sys.exit()
