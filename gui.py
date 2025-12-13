@@ -3,6 +3,7 @@ import threading
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import copy
 
 import visio_engine
 
@@ -20,6 +21,7 @@ class SubstationApp:
         self.masters_by_name = {}
         # matrix structure holds rows of dicts {'combobox':..., 'props_frame':...}
         self.matrix_widgets = []
+        self.live_visio_preview_enabled = tk.BooleanVar(value=True)
 
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -58,6 +60,13 @@ class SubstationApp:
         tk.Button(top, text="Generate Visio Layout", bg="green", fg="white", command=self.on_generate).grid(
             row=4, column=0, columnspan=3, pady=12, sticky="ew"
         )
+        tk.Checkbutton(
+            top,
+            text="Live Visio Selection Preview",
+            variable=self.live_visio_preview_enabled,
+            onvalue=True,
+            offvalue=False,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         # Shape data preview block
         preview_frame = tk.LabelFrame(self.root, text="Shape Data Preview", padx=10, pady=6)
@@ -153,10 +162,10 @@ class SubstationApp:
         self.cb_central["values"] = names
         if names:
             self.cb_central.current(0)
-            self._update_shape_data_display(names[0])
+            self._render_shape_data(f"Master: {names[0]}", self.masters_by_name.get(names[0], []))
         messagebox.showinfo("Success", f"Loaded {len(names)} masters.")
         if not names:
-            self._update_shape_data_display("")
+            self._render_shape_data("Master: (none)", [])
 
     # ------------------------
     # Build matrix UI
@@ -204,25 +213,36 @@ class SubstationApp:
                 props_frame = tk.Frame(cell_frame)
                 props_frame.pack(anchor="w", fill="x", pady=(4, 0))
 
-                # bind selection event
-                cb.bind(
-                    "<<ComboboxSelected>>",
-                    lambda e, cb=cb, pf=props_frame, le=entry_label: self._on_master_selected(cb, pf, le),
-                )
+                cell_state = {
+                    "combobox": cb,
+                    "props_frame": props_frame,
+                    "label_entry": entry_label,
+                    "selected_master": None,
+                    "selected_props": [],
+                }
 
-                row_widgets.append({"combobox": cb, "props_frame": props_frame, "label_entry": entry_label})
+                # bind selection event (store props on the cell itself)
+                cb.bind("<<ComboboxSelected>>", lambda e, cs=cell_state: self._on_master_selected(cs))
+
+                row_widgets.append(cell_state)
             self.matrix_widgets.append(row_widgets)
 
         # update scroll region
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
-    def _on_master_selected(self, combobox, props_frame, label_entry=None):
+    def _on_master_selected(self, cell_state):
+        combobox = cell_state["combobox"]
+        props_frame = cell_state["props_frame"]
+        label_entry = cell_state.get("label_entry")
+
         # clear existing children
         for w in props_frame.winfo_children():
             w.destroy()
 
         name = combobox.get()
         if not name or name == "None":
+            cell_state["selected_master"] = None
+            cell_state["selected_props"] = []
             return
 
         if label_entry is not None:
@@ -232,7 +252,9 @@ class SubstationApp:
                 label_entry.insert(0, name)
 
         props = self.masters_by_name.get(name, [])
-        self._update_shape_data_display(name)
+        # Store a snapshot so each cell keeps its own data (won't be overwritten)
+        cell_state["selected_master"] = name
+        cell_state["selected_props"] = copy.deepcopy(props)
         if not props:
             tk.Label(props_frame, text="(no shape data found)", fg="gray").pack(anchor="w")
             return
@@ -289,14 +311,12 @@ class SubstationApp:
     def _on_central_selected(self, event=None):
         name = self.cb_central.get()
         if name:
-            self._update_shape_data_display(name)
+            self._render_shape_data(f"Master: {name}", self.masters_by_name.get(name, []))
 
-    def _update_shape_data_display(self, name):
+    def _render_shape_data(self, title, props):
         if not hasattr(self, "shape_data_text") or self.shape_data_text is None:
             return
-        props = self.masters_by_name.get(name, [])
-
-        lines = [f"Master: {name or '(none)'}", "-" * 40]
+        lines = [title or "Shape Data", "-" * 40]
         if props:
             for prop in props:
                 t = prop.get("type", "")
@@ -311,15 +331,36 @@ class SubstationApp:
         self.shape_data_text.insert(tk.END, text_value)
         self.shape_data_text.configure(state="disabled")
 
+    def _on_visio_selection_payload(self, payload):
+        # Called from a COM event thread; marshal to Tk main thread.
+        try:
+            title = payload.get("title", "Selected: (unknown)")
+            props = payload.get("props", [])
+        except Exception:
+            title = "Selected: (unknown)"
+            props = []
+
+        self.root.after(0, lambda: self._render_shape_data(title, props))
+
     def _thread_generate(self, data):
         try:
             self.engine.generate_layout(data)
-            self.root.after(0, lambda: messagebox.showinfo("Success", "Visio layout generated!"))
+            def _after():
+                messagebox.showinfo("Success", "Visio layout generated!")
+                if self.live_visio_preview_enabled.get():
+                    # Start live preview: click shapes in Visio to see their data here.
+                    self.engine.start_selection_watch(self._on_visio_selection_payload)
+
+            self.root.after(0, _after)
         except Exception as e:
             tb = traceback.format_exc()
             print(tb)
             self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
 
     def on_close(self):
+        try:
+            self.engine.stop_selection_watch()
+        except Exception:
+            pass
         self.root.destroy()
         sys.exit()

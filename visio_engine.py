@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+import threading
 import time
 
 import pythoncom
@@ -11,6 +12,8 @@ from win32com.client import constants
 class VisioEngine:
     def __init__(self):
         self.current_stencil_path = None
+        self._selection_thread = None
+        self._selection_stop = None
 
     # Always return a stable Visio instance (visible = True)
     def _get_visio(self):
@@ -95,6 +98,87 @@ class VisioEngine:
             return final
         finally:
             pythoncom.CoUninitialize()
+
+    # ----------------------------------------------------------
+    # Live selection watcher: when user clicks shapes in Visio,
+    # call the provided callback with shape + Shape Data.
+    #
+    # callback signature:
+    #   callback({"title": <str>, "props": <list[dict]>})
+    # ----------------------------------------------------------
+    def start_selection_watch(self, callback):
+        if self._selection_thread and self._selection_thread.is_alive():
+            return
+
+        self._selection_stop = threading.Event()
+
+        def _run():
+            pythoncom.CoInitialize()
+            try:
+                app, _docs = self._get_visio()
+                engine = self
+
+                class _AppEvents:
+                    def __init__(self):
+                        self._last_sig = None
+
+                    def SelectionChanged(self, window):
+                        try:
+                            sel = getattr(window, "Selection", None)
+                            if sel is None:
+                                return
+                            try:
+                                cnt = int(sel.Count)
+                            except Exception:
+                                cnt = 0
+                            if cnt <= 0:
+                                return
+
+                            try:
+                                shp = sel.Item(1)
+                            except Exception:
+                                return
+
+                            title = engine._format_shape_title(shp)
+                            props = engine._collect_shape_properties_from_instance(shp)
+
+                            # Avoid spamming callback with identical payloads
+                            sig = (title, len(props))
+                            if sig == self._last_sig:
+                                return
+                            self._last_sig = sig
+
+                            try:
+                                callback({"title": title, "props": props})
+                            except Exception:
+                                return
+                        except Exception:
+                            return
+
+                handler = win32com.client.WithEvents(app, _AppEvents)
+
+                while not self._selection_stop.is_set():
+                    try:
+                        pythoncom.PumpWaitingMessages()
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+
+                _ = handler  # keep alive until exit
+            finally:
+                pythoncom.CoUninitialize()
+
+        self._selection_thread = threading.Thread(target=_run, daemon=True)
+        self._selection_thread.start()
+
+    def stop_selection_watch(self):
+        if self._selection_stop is not None:
+            try:
+                self._selection_stop.set()
+            except Exception:
+                pass
+        self._selection_stop = None
+        self._selection_thread = None
 
     # ----------------------------------------------------------
     # Generate the real Visio layout (NO PREVIEW)
@@ -256,6 +340,32 @@ class VisioEngine:
     # ------------------------
     # Shape Data extraction
     # ------------------------
+    def _format_shape_title(self, shp):
+        if shp is None:
+            return "Selected: (none)"
+
+        master_name = ""
+        try:
+            m = getattr(shp, "Master", None)
+            if m is not None:
+                master_name = self._normalize(getattr(m, "Name", "")) or self._normalize(getattr(m, "NameU", ""))
+        except Exception:
+            master_name = ""
+
+        shape_id = ""
+        try:
+            shape_id = self._normalize(getattr(shp, "NameU", "")) or self._normalize(getattr(shp, "Name", ""))
+        except Exception:
+            shape_id = ""
+
+        if master_name and shape_id:
+            return f"Selected: {master_name} ({shape_id})"
+        if master_name:
+            return f"Selected: {master_name}"
+        if shape_id:
+            return f"Selected: {shape_id}"
+        return "Selected: (unknown shape)"
+
     def _collect_shape_properties_from_instance(self, root_shape):
         props = []
         try:
@@ -286,10 +396,7 @@ class VisioEngine:
 
     def _collect_props_from_shape(self, shape, parent_name=""):
         results = []
-        try:
-            shape_name = self._normalize(getattr(shape, "Name", "")) or parent_name
-        except Exception:
-            shape_name = parent_name
+        shape_name = self._shape_display_name(shape, parent_name)
 
         # Collect both "Shape Data" (Prop) and common User-defined fields
         results.extend(self._extract_prop_rows(shape, shape_name))
@@ -302,6 +409,26 @@ class VisioEngine:
         except Exception:
             pass
         return results
+
+    def _shape_display_name(self, shape, fallback):
+        # Prefer the shape's master name (more stable than Sheet.12)
+        try:
+            m = getattr(shape, "Master", None)
+            if m is not None:
+                nm = self._normalize(getattr(m, "Name", "")) or self._normalize(getattr(m, "NameU", ""))
+                if nm:
+                    return nm
+        except Exception:
+            pass
+
+        try:
+            nm = self._normalize(getattr(shape, "NameU", "")) or self._normalize(getattr(shape, "Name", ""))
+            if nm:
+                return nm
+        except Exception:
+            pass
+
+        return fallback or "Shape"
 
     def _extract_prop_rows(self, shape, shape_name):
         props = []
