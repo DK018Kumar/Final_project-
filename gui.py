@@ -349,21 +349,17 @@ class SubstationApp:
             if type_counts.get(tv, 0) > 1:
                 suffix = f" ({type_seen[tv]})"
 
-            block = tk.LabelFrame(pf, text=f"TYPE: {tv}{suffix}", padx=6, pady=4)
+            block = tk.LabelFrame(pf, text=f"{tv}{suffix}", padx=6, pady=4)
             block.pack(fill="x", anchor="w", pady=(6, 0))
 
-            actions = tk.Frame(block)
-            actions.pack(anchor="w", pady=(0, 6))
-            tk.Button(
-                actions,
-                text="Replace…",
-                command=lambda part=p: self._replace_part_via_dialog(cell_state, part),
-            ).pack(side="left")
-            tk.Button(
-                actions,
-                text="Delete",
-                command=lambda part=p: self._delete_part(cell_state, part),
-            ).pack(side="left", padx=(8, 0))
+            # Click anywhere in this block to act on THIS element only.
+            def _bind_click(w, part=p):
+                try:
+                    w.bind("<Button-1>", lambda _e, cs=cell_state, prt=part: self._open_part_actions(cs, prt))
+                except Exception:
+                    pass
+
+            _bind_click(block)
 
             if not sd:
                 tk.Label(block, text="(no Prop rows)", fg="gray").pack(anchor="w")
@@ -373,14 +369,70 @@ class SubstationApp:
             header.pack(fill="x", anchor="w")
             tk.Label(header, text="Label", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
             tk.Label(header, text="Value", font=("Arial", 9, "bold")).grid(row=0, column=1, sticky="w")
+            _bind_click(header)
 
             for _row_name, row_dict in sd.items():
+                # Avoid duplicating the element identifier row in the details list.
+                if str(_row_name).strip().upper() == "TYPE":
+                    continue
                 lbl = (row_dict.get("label") or "").strip()
                 val = (row_dict.get("value") or "").strip()
+                # Hide empty rows to reduce noise
+                if not lbl and not val:
+                    continue
                 row = tk.Frame(block)
                 row.pack(fill="x", anchor="w", pady=1)
-                tk.Label(row, text=lbl, anchor="w", width=18).grid(row=0, column=0, sticky="w", padx=(0, 8))
-                tk.Label(row, text=val, anchor="w", wraplength=280, justify="left").grid(row=0, column=1, sticky="w")
+                l1 = tk.Label(row, text=lbl, anchor="w", width=18)
+                l1.grid(row=0, column=0, sticky="w", padx=(0, 8))
+                l2 = tk.Label(row, text=val, anchor="w", wraplength=280, justify="left")
+                l2.grid(row=0, column=1, sticky="w")
+                _bind_click(row)
+                _bind_click(l1)
+                _bind_click(l2)
+
+    def _open_part_actions(self, cell_state, part):
+        """
+        Single-click action chooser for an internal element (identified by Prop.TYPE.Value).
+        Replaces/deletes ONLY that element, not the whole stencil/substation.
+        """
+        tv = (part.get("type_value") or "").strip() or "(unknown TYPE)"
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Element actions: {tv}")
+        dlg.transient(self.root)
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+
+        tk.Label(
+            dlg,
+            text=f"Selected element (Prop.TYPE.Value):\n{tv}\n\nChoose an action for ONLY this element:",
+            justify="left",
+            padx=10,
+            pady=10,
+        ).pack(anchor="w")
+
+        btns = tk.Frame(dlg, padx=10, pady=10)
+        btns.pack(anchor="w")
+
+        def _do_replace():
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+            self._replace_part_via_dialog(cell_state, part)
+
+        def _do_delete():
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+            self._delete_part(cell_state, part)
+
+        tk.Button(btns, text="Replace…", command=_do_replace).pack(side="left")
+        tk.Button(btns, text="Delete", command=_do_delete).pack(side="left", padx=(10, 0))
+        tk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=(10, 0))
 
     def _delete_part(self, cell_state, part):
         page_id = part.get("page_id")
