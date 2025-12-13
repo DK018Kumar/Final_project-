@@ -1102,13 +1102,12 @@ class VisioEngine:
         y_min = min(bottom, top)
         y_max = max(bottom, top)
 
-        # Place a small label rectangle just above the top-left of the shape.
-        # (Top-left alignment, bold text)
-        height = 0.55
-        gap = 0.20
+        # Place a clearly visible textbox just above the top-left of the shape.
+        height = 0.70
+        gap = 0.25
 
-        # Width based on text length (bounded)
-        width = max(1.8, min(6.0, 0.16 * max(1, len(label_text))))
+        # Width based on text length (more forgiving so it doesn't clip)
+        width = max(3.5, min(10.0, 0.28 * max(1, len(label_text))))
 
         rect_left = x_min
         rect_right = rect_left + width
@@ -1127,13 +1126,25 @@ class VisioEngine:
         except Exception:
             pass
 
-        # Transparent box (text only)
+        # Visible textbox (border + light fill)
         try:
-            t.CellsU("LinePattern").FormulaU = "0"
+            t.CellsU("LinePattern").FormulaU = "1"
         except Exception:
             pass
         try:
-            t.CellsU("FillPattern").FormulaU = "0"
+            t.CellsU("LineWeight").FormulaU = "0.012 in"
+        except Exception:
+            pass
+        try:
+            t.CellsU("LineColor").FormulaU = "RGB(0,0,0)"
+        except Exception:
+            pass
+        try:
+            t.CellsU("FillPattern").FormulaU = "1"
+        except Exception:
+            pass
+        try:
+            t.CellsU("FillForegnd").FormulaU = "RGB(255,255,255)"
         except Exception:
             pass
 
@@ -1171,6 +1182,14 @@ class VisioEngine:
             pass
         try:
             t.CellsU("TextBlock.MarginTop").FormulaU = "0.02 in"
+        except Exception:
+            pass
+        try:
+            t.CellsU("TextBlock.MarginBottom").FormulaU = "0.02 in"
+        except Exception:
+            pass
+        try:
+            t.CellsU("TextBlock.Wrap").FormulaU = "1"
         except Exception:
             pass
 
