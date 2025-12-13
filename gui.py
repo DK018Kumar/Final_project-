@@ -355,8 +355,25 @@ class SubstationApp:
             block = tk.Frame(pf, relief="groove", bd=1, padx=6, pady=4)
             block.pack(fill="x", anchor="w", pady=(6, 0))
 
-            header_lbl = tk.Label(block, text=f"{tv}{suffix}", font=("Arial", 9, "bold"), anchor="w")
-            header_lbl.pack(fill="x", anchor="w", pady=(0, 4))
+            header_row = tk.Frame(block)
+            header_row.pack(fill="x", anchor="w", pady=(0, 4))
+
+            header_lbl = tk.Label(header_row, text=f"{tv}{suffix}", font=("Arial", 9, "bold"), anchor="w")
+            header_lbl.pack(side="left", fill="x", expand=True)
+
+            # Always provide explicit buttons (mouse bindings can be blocked by focus/overlays on some systems).
+            btn_replace = tk.Button(
+                header_row,
+                text="Replace…",
+                command=lambda cs=cell_state, prt=p: self._replace_part_via_dialog(cs, prt),
+            )
+            btn_replace.pack(side="left", padx=(8, 0))
+            btn_delete = tk.Button(
+                header_row,
+                text="Delete",
+                command=lambda cs=cell_state, prt=p: self._delete_part(cs, prt),
+            )
+            btn_delete.pack(side="left", padx=(6, 0))
 
             if not sd:
                 tk.Label(block, text="(no Prop rows)", fg="gray").pack(anchor="w")
@@ -387,7 +404,9 @@ class SubstationApp:
 
                 # Make the data area clickable for actions on this element.
                 self._make_part_clickable(block, cell_state, p)
+                self._make_part_clickable(header_row, cell_state, p)
                 self._make_part_clickable(header_lbl, cell_state, p)
+                # Keep buttons clickable as buttons; do not bind click-to-action on them
                 self._make_part_clickable(header, cell_state, p)
                 self._make_part_clickable(h1, cell_state, p)
                 self._make_part_clickable(h2, cell_state, p)
@@ -397,6 +416,7 @@ class SubstationApp:
 
             # Also allow clicking header when there are zero displayed rows (all empty/hidden)
             self._make_part_clickable(block, cell_state, p)
+            self._make_part_clickable(header_row, cell_state, p)
             self._make_part_clickable(header_lbl, cell_state, p)
             self._make_part_clickable(header, cell_state, p)
             self._make_part_clickable(h1, cell_state, p)
@@ -413,6 +433,11 @@ class SubstationApp:
         except Exception:
             pass
         try:
+            widget.bind(
+                "<Button-1>",
+                lambda _e, cs=cell_state, prt=part: self._safe_open_part_actions(cs, prt),
+                add="+",
+            )
             widget.bind(
                 "<ButtonRelease-1>",
                 lambda _e, cs=cell_state, prt=part: self._safe_open_part_actions(cs, prt),
