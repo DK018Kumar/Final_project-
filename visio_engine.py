@@ -30,7 +30,10 @@ class VisioEngine:
 
     # ----------------------------------------------------------
     # Load stencil + extract master names + shape data (best-effort)
-    # Returns list of dicts: {'name': <str>, 'shape_data': [{'label':..., 'value':...}, ...]}
+    # Backward compatible return:
+    # - 'name': master name
+    # - 'shape_data': [{'label':..., 'value':...}, ...]  (ShapeSheet Prop rows)
+    # - 'props': [{'type':..., 'value':...}, ...]        (legacy UI format)
     # ----------------------------------------------------------
     def load_stencil_masters(self, stencil_path):
         pythoncom.CoInitialize()
@@ -82,7 +85,14 @@ class VisioEngine:
                     except Exception:
                         shape_data = []
 
-                masters_info.append({"name": name, "shape_data": shape_data})
+                masters_info.append(
+                    {
+                        "name": name,
+                        "shape_data": shape_data,
+                        # legacy: convert to old {type,value} format
+                        "props": [{"type": r.get("label", ""), "value": r.get("value", "")} for r in (shape_data or [])],
+                    }
+                )
 
             try:
                 tmp_doc.Close(False)

@@ -4,6 +4,7 @@ from gui import SubstationApp
 
 
 if __name__ == "__main__":
+    root = tk.Tk()
     # Basic High DPI awareness for clearer text on Windows
     try:
         from ctypes import windll
@@ -12,6 +13,5 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    root = tk.Tk()
     app = SubstationApp(root)
     root.mainloop()

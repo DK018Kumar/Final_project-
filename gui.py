@@ -71,6 +71,15 @@ class SubstationApp:
         central_sd_scroll.pack(side="right", fill="y")
         self.central_sd_text.configure(yscrollcommand=central_sd_scroll.set)
 
+        # Global preview (keeps original preview behavior)
+        preview_frame = tk.LabelFrame(self.root, text="Shape Data Preview (ShapeSheet)", padx=10, pady=6)
+        preview_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self.shape_data_text = tk.Text(preview_frame, height=8, wrap="none", state="disabled")
+        self.shape_data_text.pack(side="left", fill="both", expand=True)
+        preview_scroll = tk.Scrollbar(preview_frame, orient="vertical", command=self.shape_data_text.yview)
+        preview_scroll.pack(side="right", fill="y")
+        self.shape_data_text.configure(yscrollcommand=preview_scroll.set)
+
         # Scrollable area for matrix
         container = tk.Frame(self.root)
         container.pack(fill="both", expand=True, padx=10, pady=6)
@@ -158,6 +167,7 @@ class SubstationApp:
         if names:
             self.cb_central.current(0)
             self._render_central_shape_data(names[0])
+            self._render_preview_shape_data(names[0])
         messagebox.showinfo("Success", f"Loaded {len(names)} masters.")
         # Matrix cell Shape Data is shown per-cell, based on selected master and/or generated shape.
 
@@ -249,7 +259,14 @@ class SubstationApp:
         cell_state["selected_props"] = []
 
         # Show ShapeSheet Shape Data for the *master* (drop-to-temp is done in engine load)
-        self._render_cell_shape_data(cell_state, row_idx=None, col_idx=None, shape_data_rows=self.masters_by_name.get(name, []), show_replace_button=False)
+        self._render_cell_shape_data(
+            cell_state,
+            row_idx=None,
+            col_idx=None,
+            shape_data_rows=self.masters_by_name.get(name, []),
+            show_replace_button=False,
+        )
+        self._render_preview_shape_data(name)
 
     # ------------------------
     # Generate layout in Visio
@@ -285,6 +302,7 @@ class SubstationApp:
         name = self.cb_central.get()
         if name:
             self._render_central_shape_data(name)
+            self._render_preview_shape_data(name)
 
     def _render_central_shape_data(self, master_name):
         rows = self.masters_by_name.get(master_name, [])
@@ -301,6 +319,27 @@ class SubstationApp:
         self.central_sd_text.delete("1.0", tk.END)
         self.central_sd_text.insert(tk.END, text_value)
         self.central_sd_text.configure(state="disabled")
+
+    def _render_preview_shape_data(self, master_name):
+        # Global preview panel (same ShapeSheet label/value list)
+        rows = self.masters_by_name.get(master_name, [])
+        lines = [f"Master: {master_name}", "-" * 40]
+        for r in rows:
+            lbl = (r.get("label") or "").strip()
+            val = (r.get("value") or "").strip()
+            if lbl:
+                lines.append(f"{lbl}: {val}")
+        if len(lines) == 2:
+            lines.append("(no Shape Data)")
+
+        text_value = "\n".join(lines)
+        try:
+            self.shape_data_text.configure(state="normal")
+            self.shape_data_text.delete("1.0", tk.END)
+            self.shape_data_text.insert(tk.END, text_value)
+            self.shape_data_text.configure(state="disabled")
+        except Exception:
+            pass
 
     def _set_replace_target(self, cell_state, row_idx=None, col_idx=None):
         page_id = cell_state.get("visio_page_id")
