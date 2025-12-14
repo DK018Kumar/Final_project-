@@ -449,11 +449,48 @@ class VisioEngine:
             page = doc.Pages(1)
 
             # CONFIGURABLE SPACING
-            CENTRAL_X = 10.0
-            CENTRAL_Y = 15.0
             H_SPACING = 18.0
             V_SPACING = 12.0
             FIRST_ROW_OFFSET = 15.0
+
+            # Matrix (needed early to size the page so everything is visible)
+            matrix = data.get("matrix_subs", []) or []
+            rows = len(matrix)
+            cols = max((len(r) for r in matrix), default=0)
+
+            # Ensure the page is large enough so drops + name textboxes are visible.
+            # The default Visio page is small compared to the original coordinates/spacings.
+            try:
+                page_w = float(page.PageSheet.CellsU("PageWidth").ResultIU)
+                page_h = float(page.PageSheet.CellsU("PageHeight").ResultIU)
+            except Exception:
+                page_w = 0.0
+                page_h = 0.0
+
+            required_w = max(1.0, (max(cols, 1) - 1) * H_SPACING + 16.0)
+            required_h = max(1.0, (max(rows, 1) - 1) * V_SPACING + FIRST_ROW_OFFSET + 20.0)
+
+            if page_w <= 0.0:
+                page_w = required_w
+            if page_h <= 0.0:
+                page_h = required_h
+
+            if required_w > page_w:
+                try:
+                    page.PageSheet.CellsU("PageWidth").ResultIU = required_w
+                    page_w = required_w
+                except Exception:
+                    pass
+            if required_h > page_h:
+                try:
+                    page.PageSheet.CellsU("PageHeight").ResultIU = required_h
+                    page_h = required_h
+                except Exception:
+                    pass
+
+            # Place central near the top-middle of the page.
+            CENTRAL_X = page_w / 2.0
+            CENTRAL_Y = page_h - 6.0
 
             # Drop central
             central_name = (data.get("central") or "").strip()
@@ -474,11 +511,6 @@ class VisioEngine:
             # Add label above central (only if user provided)
             if central_label and bbox is not None:
                 self._place_textbox_above_bbox(page, bbox, central_label)
-
-            # Matrix
-            matrix = data.get("matrix_subs", []) or []
-            rows = len(matrix)
-            cols = max((len(r) for r in matrix), default=0)
 
             if cols > 0:
                 total_width = (cols - 1) * H_SPACING
@@ -861,6 +893,24 @@ class VisioEngine:
         except Exception:
             old_text = ""
 
+        # Preferred path: Visio-native replacement (works for sub-shapes inside groups).
+        # This keeps the shape in place and avoids coordinate-system issues.
+        try:
+            replaced = old_shape.ReplaceShape(new_master, 0)
+            target = replaced if replaced else old_shape
+
+            # Re-apply text and Shape Data best-effort
+            try:
+                if old_text:
+                    target.Text = old_text
+            except Exception:
+                pass
+            self._apply_shape_data_by_label(target, props)
+            return
+        except Exception:
+            # Fall back to drop+copy+delete
+            pass
+
         # Snapshot geometry & position (internal units)
         def _iu(cell_name: str) -> float:
             try:
@@ -876,19 +926,8 @@ class VisioEngine:
         locpinx = _iu("LocPinX")
         locpiny = _iu("LocPinY")
 
-        # If this is a sub-shape inside a group, drop into the containing group so coordinates match.
-        drop_obj = page
-        try:
-            container = getattr(old_shape, "ContainingShape", None)
-            if container:
-                drop_obj = container.Shapes
-        except Exception:
-            drop_obj = page
-
-        try:
-            new_shape = drop_obj.Drop(new_master, pinx, piny)
-        except Exception:
-            new_shape = page.Drop(new_master, pinx, piny)
+        # Fallback drop on the page (best-effort)
+        new_shape = page.Drop(new_master, pinx, piny)
 
         # Preserve size/rotation/position
         try:
