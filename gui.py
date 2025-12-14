@@ -760,7 +760,7 @@ class SubstationApp:
 
         def worker():
             try:
-                shapes = self.engine.list_shapes_with_shape_data_in_active_document()
+                shapes = self.engine.list_all_shapes_in_active_document()
                 self.root.after(0, lambda: _done(shapes))
             except Exception as e:
                 msg = str(e)

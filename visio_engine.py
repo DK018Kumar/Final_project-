@@ -75,13 +75,33 @@ class VisioEngine:
         except Exception:
             pass
 
-        # 3) First open document
+        # 3) Active page's document (often works even if ActiveDocument is None)
+        try:
+            ap = getattr(app, "ActivePage", None)
+            if ap is not None:
+                doc = getattr(ap, "Document", None)
+                if doc is not None and getattr(doc, "Pages", None) is not None:
+                    return doc
+        except Exception:
+            pass
+
+        # 4) Scan all open documents and pick the first drawing-like doc
         try:
             docs = getattr(app, "Documents", None)
             if docs is not None and getattr(docs, "Count", 0) > 0:
-                doc = docs.Item(1)
-                if doc is not None and getattr(doc, "Pages", None) is not None:
-                    return doc
+                for i in range(1, int(docs.Count) + 1):
+                    try:
+                        d = docs.Item(i)
+                    except Exception:
+                        continue
+                    try:
+                        pages = getattr(d, "Pages", None)
+                        if pages is None:
+                            continue
+                        if getattr(pages, "Count", 0) > 0:
+                            return d
+                    except Exception:
+                        continue
         except Exception:
             pass
 
@@ -566,7 +586,7 @@ class VisioEngine:
             try:
                 central_shape = page.Drop(central_master, CENTRAL_X, CENTRAL_Y)
                 bbox = self._safe_bbox(central_shape)
-                self._try_ungroup(central_shape)
+                self._try_ungroup(app, central_shape)
             except Exception:
                 central_shape = None
 
@@ -613,7 +633,7 @@ class VisioEngine:
                         continue
 
                     bbox2 = self._safe_bbox(shp)
-                    self._try_ungroup(shp)
+                    self._try_ungroup(app, shp)
 
                     # place label above dropped substation if provided
                     if label and bbox2 is not None:
@@ -643,11 +663,27 @@ class VisioEngine:
             # (Left, Bottom, Right, Top)
             return (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
         except Exception:
-            return None
+            try:
+                pinx = float(shp.CellsU("PinX").ResultIU)
+                piny = float(shp.CellsU("PinY").ResultIU)
+                w = float(shp.CellsU("Width").ResultIU)
+                h = float(shp.CellsU("Height").ResultIU)
+                return (pinx - w / 2.0, piny - h / 2.0, pinx + w / 2.0, piny + h / 2.0)
+            except Exception:
+                return None
 
-    def _try_ungroup(self, shp) -> None:
+    def _try_ungroup(self, app, shp) -> None:
         """Ungroup a dropped substation (best-effort)."""
         try:
+            # Re-apply prompt suppression right before ungroup (most reliable).
+            try:
+                _, _, c = self._com()
+                app.AlertResponse = c.visAlertResponseYes
+            except Exception:
+                try:
+                    app.AlertResponse = 6
+                except Exception:
+                    pass
             # Only groups can be ungrouped; calling on non-groups throws.
             shp.Ungroup()
         except Exception:
@@ -798,6 +834,48 @@ class VisioEngine:
                                 "depth": depth,
                             }
                         )
+                except Exception:
+                    pass
+
+                try:
+                    if shp.Shapes is not None and shp.Shapes.Count > 0:
+                        for sub in shp.Shapes:
+                            walk(page_name, sub, depth + 1)
+                except Exception:
+                    pass
+
+            for page in doc.Pages:
+                page_name = str(getattr(page, "Name", ""))
+                for shape in page.Shapes:
+                    walk(page_name, shape, 0)
+
+            return out
+        finally:
+            pythoncom.CoUninitialize()
+
+    def list_all_shapes_in_active_document(self) -> List[Dict[str, Any]]:
+        """
+        List ALL shapes (including sub-shapes) in the active drawing document.
+        This prevents the inspector UI from looking empty when the drawing has
+        shapes but no Shape Data rows.
+        """
+        pythoncom = self._co_init()
+        try:
+            app, _ = self._get_visio()
+            doc = self._get_active_document(app)
+            out: List[Dict[str, Any]] = []
+
+            def walk(page_name: str, shp, depth: int) -> None:
+                try:
+                    out.append(
+                        {
+                            "page": page_name,
+                            "shape_id": int(getattr(shp, "ID", 0)),
+                            "shape_name": str(getattr(shp, "Name", "")),
+                            "master": self._get_master_name(shp),
+                            "depth": depth,
+                        }
+                    )
                 except Exception:
                     pass
 
