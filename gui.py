@@ -656,11 +656,16 @@ class SubstationApp:
         right = tk.Frame(body)
         right.pack(side="right", fill="both", expand=True, padx=(10, 0))
 
-        tk.Label(right, text="Shape Data (recursive)", font=("Arial", 10, "bold")).pack(anchor="w")
-        details = tk.Text(right, wrap="none", height=18)
-        details.pack(fill="both", expand=True, pady=(6, 10))
-        details.insert("end", "Select a shape to view its Shape Data.\n")
-        details.config(state="disabled")
+        tk.Label(right, text="Shape Data (Label=Value)", font=("Arial", 10, "bold")).pack(anchor="w")
+
+        details_frame = tk.Frame(right)
+        details_frame.pack(fill="both", expand=True, pady=(6, 10))
+        details_scroll = tk.Scrollbar(details_frame, orient="vertical")
+        details = tk.Listbox(details_frame, activestyle="dotbox", yscrollcommand=details_scroll.set)
+        details_scroll.config(command=details.yview)
+        details.pack(side="left", fill="both", expand=True)
+        details_scroll.pack(side="right", fill="y")
+        details.insert("end", "Select a shape to view its Shape Data (Label=Value only).")
 
         repl = ttk.LabelFrame(right, text="Replace selected shape", padding=10)
         repl.pack(fill="x")
@@ -687,7 +692,8 @@ class SubstationApp:
                     names = self.engine.list_masters_in_stencil(p)
                     self.root.after(0, lambda: _done(names))
                 except Exception as e:
-                    self.root.after(0, lambda: _err(str(e)))
+                    msg = str(e)
+                    self.root.after(0, lambda msg=msg: _err(msg))
 
             def _done(names):
                 master_cb["values"] = names
@@ -725,7 +731,8 @@ class SubstationApp:
                     self.engine.replace_shape_in_active_document(page, sid, stencil, master)
                     self.root.after(0, lambda: _done())
                 except Exception as e:
-                    self.root.after(0, lambda: _err(str(e)))
+                    msg = str(e)
+                    self.root.after(0, lambda msg=msg: _err(msg))
 
             def _done():
                 status.config(text="Replacement complete. Refresh to see updates.", fg="gray")
@@ -744,7 +751,7 @@ class SubstationApp:
     def _bring_visio_front(self):
         threading.Thread(target=self.engine.bring_visio_to_front, daemon=True).start()
 
-    def _refresh_shapes(self, status_lbl: tk.Label, tree: ttk.Treeview, details: tk.Text):
+    def _refresh_shapes(self, status_lbl: tk.Label, tree: ttk.Treeview, details):
         status_lbl.config(text="Refreshing shapes from active Visio document...", fg="gray")
 
         # clear
@@ -753,26 +760,32 @@ class SubstationApp:
 
         def worker():
             try:
-                shapes = self.engine.list_shapes_in_active_document()
+                shapes = self.engine.list_shapes_with_shape_data_in_active_document()
                 self.root.after(0, lambda: _done(shapes))
             except Exception as e:
-                self.root.after(0, lambda: _err(str(e)))
+                msg = str(e)
+                self.root.after(0, lambda msg=msg: _err(msg))
 
         def _done(shapes):
             for s in shapes:
+                depth = int(s.get("depth", 0) or 0)
+                indent = ("    " * depth) if depth > 0 else ""
                 tree.insert(
                     "",
                     "end",
-                    values=(s.get("page", ""), s.get("shape_id", 0), s.get("shape_name", ""), s.get("master", "")),
+                    values=(
+                        s.get("page", ""),
+                        s.get("shape_id", 0),
+                        f"{indent}{s.get('shape_name', '')}",
+                        s.get("master", ""),
+                    ),
                 )
             status_lbl.config(text=f"Loaded {len(shapes)} shapes.", fg="gray")
-            details.config(state="normal")
-            details.delete("1.0", "end")
-            details.insert(
-                "end",
-                "Select a shape to view its Shape Data (including sub-shapes).\n",
-            )
-            details.config(state="disabled")
+            try:
+                details.delete(0, "end")
+                details.insert("end", "Select a shape to view its Shape Data (Label=Value only).")
+            except Exception:
+                pass
 
         def _err(msg):
             status_lbl.config(
@@ -786,7 +799,7 @@ class SubstationApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _load_shape_details(self, status_lbl: tk.Label, tree: ttk.Treeview, details: tk.Text):
+    def _load_shape_details(self, status_lbl: tk.Label, tree: ttk.Treeview, details):
         sel = tree.selection()
         if not sel:
             return
@@ -801,13 +814,19 @@ class SubstationApp:
                 lines = self.engine.get_shape_data_from_active_document(page, sid)
                 self.root.after(0, lambda: _done(lines))
             except Exception as e:
-                self.root.after(0, lambda: _err(str(e)))
+                msg = str(e)
+                self.root.after(0, lambda msg=msg: _err(msg))
 
         def _done(lines):
-            details.config(state="normal")
-            details.delete("1.0", "end")
-            details.insert("end", "\n".join(lines) if lines else "(no Shape Data found)")
-            details.config(state="disabled")
+            try:
+                details.delete(0, "end")
+                if lines:
+                    for ln in lines:
+                        details.insert("end", ln)
+                else:
+                    details.insert("end", "(no Label=Value Shape Data found)")
+            except Exception:
+                pass
             status_lbl.config(text="Shape data loaded.", fg="gray")
 
         def _err(msg):

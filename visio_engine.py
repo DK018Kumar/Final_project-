@@ -114,7 +114,8 @@ class VisioEngine:
                 except Exception:
                     value = ""
 
-            if label or value:
+            # Only keep useful rows: BOTH Label and Value present.
+            if label and value:
                 props.append({"label": label, "value": value})
         return props
 
@@ -155,25 +156,25 @@ class VisioEngine:
         lines: List[str] = []
         pad = "  " * indent
 
-        try:
-            nm = (getattr(shape, "Name", "") or "").strip()
-        except Exception:
-            nm = ""
-        try:
-            mid = ""
-            try:
-                if getattr(shape, "Master", None):
-                    mid = (shape.Master.Name or "").strip()
-            except Exception:
-                mid = ""
-
-            lines.append(f"{pad}- {nm or '(unnamed)'} (Master='{mid}')")
-        except Exception:
-            lines.append(f"{pad}- (shape)")
-
         props = self._snapshot_shape_data(shape)
-        for p in props:
-            lines.append(f"{pad}    → Label='{p.get('label','')}' | Value='{p.get('value','')}'")
+        if props:
+            try:
+                nm = (getattr(shape, "Name", "") or "").strip()
+            except Exception:
+                nm = ""
+            try:
+                mid = ""
+                try:
+                    if getattr(shape, "Master", None):
+                        mid = (shape.Master.Name or "").strip()
+                except Exception:
+                    mid = ""
+                lines.append(f"{pad}- {nm or '(unnamed)'} (Master='{mid}')")
+            except Exception:
+                lines.append(f"{pad}- (shape)")
+
+            for p in props:
+                lines.append(f"{pad}    → {p.get('label','')} = {p.get('value','')}")
 
         # recurse
         try:
@@ -567,11 +568,43 @@ class VisioEngine:
 
         cx = (left + right) / 2.0
 
+        # Match your reference approach (use page width/height) and clamp so the textbox
+        # is guaranteed to be visible on the page.
+        try:
+            page_w = float(page.PageSheet.CellsU("PageWidth").ResultIU)
+            page_h = float(page.PageSheet.CellsU("PageHeight").ResultIU)
+        except Exception:
+            page_w = 0.0
+            page_h = 0.0
+
         margin = 0.35
         x1 = cx - width / 2.0
-        y1 = top + margin
         x2 = cx + width / 2.0
-        y2 = y1 + height
+
+        # Preferred placement: above the shape
+        y1 = top + margin  # bottom
+        y2 = y1 + height   # top
+
+        # If above would be off-page, place inside the shape near its top edge.
+        if page_h > 0.0 and y2 > (page_h - 0.1):
+            y2 = max(0.2, min(page_h - 0.1, top - 0.1))
+            y1 = y2 - height
+
+        # Clamp within page bounds when available
+        if page_w > 0.0:
+            if x1 < 0.1:
+                x2 += (0.1 - x1)
+                x1 = 0.1
+            if x2 > (page_w - 0.1):
+                x1 -= (x2 - (page_w - 0.1))
+                x2 = page_w - 0.1
+        if page_h > 0.0:
+            if y1 < 0.1:
+                y2 += (0.1 - y1)
+                y1 = 0.1
+            if y2 > (page_h - 0.1):
+                y1 -= (y2 - (page_h - 0.1))
+                y2 = page_h - 0.1
 
         t = page.DrawRectangle(x1, y1, x2, y2)
         try:
@@ -601,11 +634,7 @@ class VisioEngine:
         except Exception:
             pass
 
-        # Make it look like a label (no border/fill)
-        try:
-            t.CellsU("LinePattern").FormulaU = "0"
-        except Exception:
-            pass
+        # Keep it clean, but still visible: no fill, keep border.
         try:
             t.CellsU("FillPattern").FormulaU = "0"
         except Exception:
@@ -639,6 +668,50 @@ class VisioEngine:
         finally:
             pythoncom.CoUninitialize()
 
+    def list_shapes_with_shape_data_in_active_document(self) -> List[Dict[str, Any]]:
+        """
+        Return shapes (including sub-shapes) that have useful Shape Data rows:
+        rows where BOTH Label and Value are present.
+
+        Adds a 'depth' field so the UI can indent children.
+        """
+        pythoncom = self._co_init()
+        try:
+            app, _ = self._get_visio()
+            doc = app.ActiveDocument
+            out: List[Dict[str, Any]] = []
+
+            def walk(page_name: str, shp, depth: int) -> None:
+                try:
+                    if self._snapshot_shape_data(shp):
+                        out.append(
+                            {
+                                "page": page_name,
+                                "shape_id": int(getattr(shp, "ID", 0)),
+                                "shape_name": str(getattr(shp, "Name", "")),
+                                "master": self._get_master_name(shp),
+                                "depth": depth,
+                            }
+                        )
+                except Exception:
+                    pass
+
+                try:
+                    if shp.Shapes is not None and shp.Shapes.Count > 0:
+                        for sub in shp.Shapes:
+                            walk(page_name, sub, depth + 1)
+                except Exception:
+                    pass
+
+            for page in doc.Pages:
+                page_name = str(getattr(page, "Name", ""))
+                for shape in page.Shapes:
+                    walk(page_name, shape, 0)
+
+            return out
+        finally:
+            pythoncom.CoUninitialize()
+
     def get_shape_data_from_active_document(self, page_name: str, shape_id: int) -> List[str]:
         pythoncom = self._co_init()
         try:
@@ -650,7 +723,8 @@ class VisioEngine:
             shape = self._find_shape_by_id(page, shape_id)
             if shape is None:
                 raise RuntimeError(f"Shape not found (ID={shape_id}) on page '{page_name}'")
-            return self._format_shape_data_recursive(shape)
+            props = self._snapshot_shape_data(shape)
+            return [f"{p.get('label','')} = {p.get('value','')}" for p in props]
         finally:
             pythoncom.CoUninitialize()
 
@@ -671,7 +745,8 @@ class VisioEngine:
                 raise RuntimeError(f"Shape not found (ID={shape_id}) on page '{page_name}'")
 
             # Open stencil read-only
-            stencil_doc = app.Documents.OpenEx(stencil_path, 64)  # visOpenRO
+            _, _, c = self._com()
+            stencil_doc = app.Documents.OpenEx(stencil_path, c.visOpenRO)
 
             new_master = None
             try:
@@ -702,7 +777,8 @@ class VisioEngine:
             if not os.path.isfile(stencil_path):
                 raise RuntimeError(f"Stencil file not found: {stencil_path}")
             app, _ = self._get_visio()
-            stencil_doc = app.Documents.OpenEx(stencil_path, 64)  # visOpenRO
+            _, _, c = self._com()
+            stencil_doc = app.Documents.OpenEx(stencil_path, c.visOpenRO)
             names: List[str] = []
             try:
                 for m in stencil_doc.Masters:
@@ -800,7 +876,19 @@ class VisioEngine:
         locpinx = _iu("LocPinX")
         locpiny = _iu("LocPinY")
 
-        new_shape = page.Drop(new_master, pinx, piny)
+        # If this is a sub-shape inside a group, drop into the containing group so coordinates match.
+        drop_obj = page
+        try:
+            container = getattr(old_shape, "ContainingShape", None)
+            if container:
+                drop_obj = container.Shapes
+        except Exception:
+            drop_obj = page
+
+        try:
+            new_shape = drop_obj.Drop(new_master, pinx, piny)
+        except Exception:
+            new_shape = page.Drop(new_master, pinx, piny)
 
         # Preserve size/rotation/position
         try:
