@@ -25,6 +25,94 @@ class VisioEngine:
     def _normalize(self, name):
         return " ".join(name.strip().split()) if name else ""
 
+    def _find_master(self, stencil, name):
+        if not name:
+            return None
+        try:
+            return stencil.Masters.Item(name)
+        except Exception:
+            pass
+        # Fallback: normalized, case-insensitive scan
+        for m in stencil.Masters:
+            try:
+                if (
+                    self._normalize(getattr(m, "Name", "")).lower()
+                    == self._normalize(name).lower()
+                ):
+                    return m
+            except Exception:
+                continue
+        return None
+
+    # ----------------------------------------------------------
+    # Render a single master to a PNG preview (best-effort)
+    # Returns: absolute path to generated PNG
+    # ----------------------------------------------------------
+    def render_master_preview(self, master_name):
+        pythoncom.CoInitialize()
+        stencil = None
+        doc = None
+        try:
+            if not self.current_stencil_path:
+                raise Exception("Stencil not loaded.")
+
+            app, docs = self._get_visio()
+
+            # Use a per-operation copy to reduce file-lock issues
+            base = os.path.basename(self.current_stencil_path)
+            stencil_copy = os.path.join(
+                tempfile.gettempdir(),
+                f"preview_{int(time.time() * 1000)}_{base}",
+            )
+            shutil.copy2(self.current_stencil_path, stencil_copy)
+            stencil = docs.OpenEx(stencil_copy, 64)
+
+            master = self._find_master(stencil, master_name)
+            if master is None:
+                raise Exception(f"Master '{master_name}' not found.")
+
+            doc = docs.Add("")
+            page = doc.Pages(1)
+
+            # Drop near center of a default page
+            try:
+                page.Drop(master, 4.25, 5.5)
+            except Exception:
+                # If drop fails, still try exporting the page
+                pass
+
+            # Fit view if possible (doesn't affect export in all cases, but helps user)
+            try:
+                app.ActiveWindow.Zoom = constants.visZoomFitPage
+            except Exception:
+                pass
+
+            out_path = os.path.join(
+                tempfile.gettempdir(),
+                f"master_preview_{int(time.time() * 1000)}.png",
+            )
+            page.Export(out_path)
+
+            # Avoid save prompts on close
+            try:
+                doc.Saved = True
+            except Exception:
+                pass
+
+            return out_path
+        finally:
+            try:
+                if stencil is not None:
+                    stencil.Close()
+            except Exception:
+                pass
+            try:
+                if doc is not None:
+                    doc.Close()
+            except Exception:
+                pass
+            pythoncom.CoUninitialize()
+
     # ----------------------------------------------------------
     # Load stencil + extract master names + shape data (best-effort)
     # Returns list of dicts: {'name': <str>, 'props': [{'type':..., 'value':...}, ...]}
@@ -187,20 +275,7 @@ class VisioEngine:
 
             # Drop central
             central_name = data.get("central")
-            try:
-                central_master = stencil.Masters.Item(central_name)
-            except Exception:
-                central_master = None
-                for m in stencil.Masters:
-                    try:
-                        if (
-                            self._normalize(m.Name).lower()
-                            == self._normalize(central_name).lower()
-                        ):
-                            central_master = m
-                            break
-                    except Exception:
-                        continue
+            central_master = self._find_master(stencil, central_name)
 
             if central_master is None:
                 raise Exception(f"Central master '{central_name}' not found.")
@@ -236,20 +311,7 @@ class VisioEngine:
                         continue
 
                     # find master
-                    try:
-                        m_obj = stencil.Masters.Item(name)
-                    except Exception:
-                        m_obj = None
-                        for item in stencil.Masters:
-                            try:
-                                if (
-                                    self._normalize(item.Name).lower()
-                                    == self._normalize(name).lower()
-                                ):
-                                    m_obj = item
-                                    break
-                            except Exception:
-                                continue
+                    m_obj = self._find_master(stencil, name)
 
                     if m_obj is None:
                         continue

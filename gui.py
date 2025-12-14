@@ -21,12 +21,28 @@ class SubstationApp:
         # matrix structure holds rows of dicts {'combobox':..., 'props_frame':...}
         self.matrix_widgets = []
 
+        # Preview state (shared across tabs)
+        self._preview_cache = {}  # master_name -> png_path
+        self._preview_photo = None
+        self._preview_image_id = None
+        self._preview_loading_for = None
+
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def setup_ui(self):
+        # Main split: left notebook, right preview (shared for both tabs)
+        self.main_pane = ttk.Panedwindow(self.root, orient="horizontal")
+        self.main_pane.pack(fill="both", expand=True)
+
+        self.left_frame = ttk.Frame(self.main_pane)
+        self.right_frame = ttk.Frame(self.main_pane)
+
+        self.main_pane.add(self.left_frame, weight=3)
+        self.main_pane.add(self.right_frame, weight=2)
+
         # Notebook with two sections (tabs)
-        self.notebook = ttk.Notebook(self.root)
+        self.notebook = ttk.Notebook(self.left_frame)
         self.notebook.pack(fill="both", expand=True)
 
         self.tab_central = ttk.Frame(self.notebook)
@@ -37,6 +53,7 @@ class SubstationApp:
 
         self._build_central_tab()
         self._build_other_substations_tab()
+        self._build_preview_pane()
 
     # ------------------------
     # Central tab
@@ -55,6 +72,10 @@ class SubstationApp:
         tk.Label(top, text="Central Substation:").grid(row=1, column=0, sticky="w", pady=10)
         self.cb_central = ttk.Combobox(top, state="readonly", width=60)
         self.cb_central.grid(row=1, column=1, sticky="w", padx=6)
+        self.cb_central.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._request_preview(self.cb_central.get()),
+        )
 
         hint = tk.Label(
             self.tab_central,
@@ -134,16 +155,22 @@ class SubstationApp:
             pass
 
     def _on_canvas_configure(self, event):
-        # match inner frame width optionally
+        # Do NOT force the embedded frame width; forcing width disables horizontal scrolling.
+        # We just keep scrollregion updated.
         try:
-            self.canvas.itemconfig(self.canvas_window, width=event.width)
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         except Exception:
             pass
 
     def _on_mousewheel_windows(self, event):
-        # For vertical scrolling; event.delta is multiple of 120 on Windows
+        # For vertical scrolling; SHIFT+wheel for horizontal scrolling
         try:
-            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            delta_units = int(-1 * (event.delta / 120))
+            # state bit 0x0001 is SHIFT on Windows Tk
+            if getattr(event, "state", 0) & 0x0001:
+                self.canvas.xview_scroll(delta_units, "units")
+            else:
+                self.canvas.yview_scroll(delta_units, "units")
         except Exception:
             pass
 
@@ -181,10 +208,23 @@ class SubstationApp:
         self.masters_by_name = {m["name"]: m.get("props", []) for m in masters}
         names = list(self.masters_by_name.keys())
 
+        # Clear preview cache on new load (previews are tied to stencil content)
+        self._preview_cache = {}
+        self._preview_loading_for = None
+        try:
+            self.preview_canvas.delete("all")
+        except Exception:
+            pass
+        try:
+            self.preview_status.config(text="Select a substation to preview.", fg="gray")
+        except Exception:
+            pass
+
         self.lbl_stencil.config(text="Database Loaded", fg="black")
         self.cb_central["values"] = names
         if names:
             self.cb_central.current(0)
+            self._request_preview(names[0])
 
         # If matrix is already built, refresh its combobox values
         self._refresh_matrix_combobox_values()
@@ -265,6 +305,9 @@ class SubstationApp:
         if not name or name == "None":
             return
 
+        # Update preview (shared pane)
+        self._request_preview(name)
+
         props = self.masters_by_name.get(name, [])
         if not props:
             tk.Label(props_frame, text="(no shape data found)", fg="gray").pack(anchor="w")
@@ -336,3 +379,100 @@ class SubstationApp:
             self.root.destroy()
         finally:
             sys.exit()
+
+    # ------------------------
+    # Shared preview pane
+    # ------------------------
+    def _build_preview_pane(self):
+        header = tk.Frame(self.right_frame, padx=10, pady=10)
+        header.pack(fill="x")
+        tk.Label(header, text="Preview", font=("Arial", 11, "bold")).pack(anchor="w")
+        self.preview_status = tk.Label(
+            header,
+            text="Select a substation to preview.",
+            fg="gray",
+            anchor="w",
+            justify="left",
+        )
+        self.preview_status.pack(fill="x", pady=(6, 0))
+
+        body = tk.Frame(self.right_frame, padx=10, pady=10)
+        body.pack(fill="both", expand=True)
+
+        self.preview_canvas = tk.Canvas(body, borderwidth=1, relief="sunken", background="white")
+        self.preview_canvas.pack(side="left", fill="both", expand=True)
+
+        pv_scroll = tk.Scrollbar(body, orient="vertical", command=self.preview_canvas.yview)
+        pv_scroll.pack(side="right", fill="y")
+        ph_scroll = tk.Scrollbar(self.right_frame, orient="horizontal", command=self.preview_canvas.xview)
+        ph_scroll.pack(side="bottom", fill="x")
+
+        self.preview_canvas.configure(yscrollcommand=pv_scroll.set, xscrollcommand=ph_scroll.set)
+
+        # simple drag-to-pan
+        self.preview_canvas.bind("<ButtonPress-1>", self._preview_pan_start)
+        self.preview_canvas.bind("<B1-Motion>", self._preview_pan_move)
+
+    def _preview_pan_start(self, event):
+        try:
+            self.preview_canvas.scan_mark(event.x, event.y)
+        except Exception:
+            pass
+
+    def _preview_pan_move(self, event):
+        try:
+            self.preview_canvas.scan_dragto(event.x, event.y, gain=1)
+        except Exception:
+            pass
+
+    def _request_preview(self, master_name: str):
+        name = (master_name or "").strip()
+        if not name or name == "None":
+            return
+
+        # if cached, show immediately
+        cached_path = self._preview_cache.get(name)
+        if cached_path:
+            self._show_preview_image(name, cached_path)
+            return
+
+        if not self.engine.current_stencil_path:
+            self.preview_status.config(text="Load the substation database to preview.", fg="gray")
+            return
+
+        # avoid spawning multiple concurrent preview threads for same master
+        if self._preview_loading_for == name:
+            return
+        self._preview_loading_for = name
+
+        self.preview_status.config(text=f"Loading preview: {name}", fg="gray")
+        threading.Thread(target=self._thread_preview, args=(name,), daemon=True).start()
+
+    def _thread_preview(self, name: str):
+        try:
+            png_path = self.engine.render_master_preview(name)
+            self.root.after(0, lambda: self._after_preview_ready(name, png_path))
+        except Exception as e:
+            self.root.after(0, lambda: self._after_preview_error(name, str(e)))
+
+    def _after_preview_ready(self, name: str, png_path: str):
+        self._preview_loading_for = None
+        self._preview_cache[name] = png_path
+        self._show_preview_image(name, png_path)
+
+    def _after_preview_error(self, name: str, err: str):
+        self._preview_loading_for = None
+        self.preview_status.config(text=f"Preview failed for '{name}': {err}", fg="red")
+
+    def _show_preview_image(self, name: str, png_path: str):
+        try:
+            img = tk.PhotoImage(file=png_path)
+        except Exception as e:
+            self.preview_status.config(text=f"Could not load preview image: {e}", fg="red")
+            return
+
+        self._preview_photo = img  # keep reference
+        self.preview_canvas.delete("all")
+        self._preview_image_id = self.preview_canvas.create_image(0, 0, anchor="nw", image=img)
+        self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all"))
+        self.preview_status.config(text=f"Preview: {name}", fg="black")
