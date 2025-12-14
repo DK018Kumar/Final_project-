@@ -38,13 +38,13 @@ class VisioEngine:
         except Exception:
             app = win32com.Dispatch("Visio.Application")
         app.Visible = True
-        # Auto-accept OK/Yes prompts (e.g., Ungroup breaks master link).
-        # This prevents Visio modal dialogs from blocking automation.
+        # Auto-accept prompts (e.g., Ungroup breaks master link).
+        # Visio uses different button sets depending on prompt; "Yes" usually maps to "confirm".
         try:
-            app.AlertResponse = c.visAlertResponseOK
+            app.AlertResponse = c.visAlertResponseYes
         except Exception:
             try:
-                app.AlertResponse = 1
+                app.AlertResponse = 6
             except Exception:
                 pass
         docs = app.Documents
@@ -737,6 +737,11 @@ class VisioEngine:
         # Keep it clean, but still visible: no fill, keep border.
         try:
             t.CellsU("FillPattern").FormulaU = "0"
+        except Exception:
+            pass
+        try:
+            # Ensure border is visible (some templates default to no line)
+            t.CellsU("LinePattern").FormulaU = "1"
         except Exception:
             pass
 
