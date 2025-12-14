@@ -32,14 +32,63 @@ class VisioEngine:
 
     # Always return a stable Visio instance (visible = True)
     def _get_visio(self):
-        _, win32com, _ = self._com()
+        _, win32com, c = self._com()
         try:
             app = win32com.GetActiveObject("Visio.Application")
         except Exception:
             app = win32com.Dispatch("Visio.Application")
         app.Visible = True
+        # Auto-accept OK/Yes prompts (e.g., Ungroup breaks master link).
+        # This prevents Visio modal dialogs from blocking automation.
+        try:
+            app.AlertResponse = c.visAlertResponseOK
+        except Exception:
+            try:
+                app.AlertResponse = 1
+            except Exception:
+                pass
         docs = app.Documents
         return app, docs
+
+    def _get_active_document(self, app):
+        """
+        Robustly resolve the active Visio drawing document.
+
+        Visio automation sometimes returns ActiveDocument=None even when a document is open
+        (e.g., focus on a stencil window, start screen, or no drawing activated).
+        """
+        # 1) Standard path
+        try:
+            doc = getattr(app, "ActiveDocument", None)
+            if doc is not None and getattr(doc, "Pages", None) is not None:
+                return doc
+        except Exception:
+            pass
+
+        # 2) Active window's document
+        try:
+            win = getattr(app, "ActiveWindow", None)
+            if win is not None:
+                doc = getattr(win, "Document", None)
+                if doc is not None and getattr(doc, "Pages", None) is not None:
+                    return doc
+        except Exception:
+            pass
+
+        # 3) First open document
+        try:
+            docs = getattr(app, "Documents", None)
+            if docs is not None and getattr(docs, "Count", 0) > 0:
+                doc = docs.Item(1)
+                if doc is not None and getattr(doc, "Pages", None) is not None:
+                    return doc
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            "No active Visio drawing document found. Open a .vsdx and click inside the drawing page, "
+            "then press Refresh."
+        )
 
     def _normalize(self, name: str) -> str:
         return " ".join(name.strip().split()) if name else ""
@@ -447,6 +496,19 @@ class VisioEngine:
             # Create new drawing
             doc = docs.Add("")
             page = doc.Pages(1)
+            # Make sure the new drawing is the active document/window.
+            try:
+                doc.Activate()
+            except Exception:
+                pass
+            try:
+                page.Activate()
+            except Exception:
+                pass
+            try:
+                app.ActiveWindow.Page = page
+            except Exception:
+                pass
 
             # CONFIGURABLE SPACING
             H_SPACING = 18.0
@@ -595,8 +657,9 @@ class VisioEngine:
         """Place a bold centered textbox slightly above the given bbox."""
         _, _, c = self._com()
         left, bottom, right, top = bbox
-        width = max(2.0, min(5.0, (right - left) * 0.9))
-        height = 0.8
+        # Use a stable, visible textbox size (like your reference snippet)
+        width = 3.0
+        height = 1.0
 
         cx = (left + right) / 2.0
 
@@ -658,6 +721,11 @@ class VisioEngine:
         except Exception:
             pass
         try:
+            # Force black text for visibility
+            t.CellsU("Char.Color").FormulaU = "RGB(0,0,0)"
+        except Exception:
+            pass
+        try:
             t.CellsU("Para.HorzAlign").FormulaU = "1"  # center
         except Exception:
             pass
@@ -684,7 +752,7 @@ class VisioEngine:
         pythoncom = self._co_init()
         try:
             app, _ = self._get_visio()
-            doc = app.ActiveDocument
+            doc = self._get_active_document(app)
             out: List[Dict[str, Any]] = []
             for page in doc.Pages:
                 for shape in page.Shapes:
@@ -710,7 +778,7 @@ class VisioEngine:
         pythoncom = self._co_init()
         try:
             app, _ = self._get_visio()
-            doc = app.ActiveDocument
+            doc = self._get_active_document(app)
             out: List[Dict[str, Any]] = []
 
             def walk(page_name: str, shp, depth: int) -> None:
@@ -748,7 +816,7 @@ class VisioEngine:
         pythoncom = self._co_init()
         try:
             app, _ = self._get_visio()
-            doc = app.ActiveDocument
+            doc = self._get_active_document(app)
             page = self._find_page_by_name(doc, page_name)
             if page is None:
                 raise RuntimeError(f"Page not found: {page_name}")
@@ -768,7 +836,7 @@ class VisioEngine:
                 raise RuntimeError(f"Stencil file not found: {stencil_path}")
 
             app, _ = self._get_visio()
-            doc = app.ActiveDocument
+            doc = self._get_active_document(app)
             page = self._find_page_by_name(doc, page_name)
             if page is None:
                 raise RuntimeError(f"Page not found: {page_name}")
