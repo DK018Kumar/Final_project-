@@ -39,12 +39,13 @@ class VisioEngine:
             app = win32com.Dispatch("Visio.Application")
         app.Visible = True
         # Auto-accept prompts (e.g., Ungroup breaks master link).
-        # Visio uses different button sets depending on prompt; "Yes" usually maps to "confirm".
+        # Some Visio prompts are OK/Cancel (needs OK=1), others Yes/No (needs Yes=6).
+        # We'll default to OK at startup and override again right before risky calls.
         try:
-            app.AlertResponse = c.visAlertResponseYes
+            app.AlertResponse = c.visAlertResponseOK
         except Exception:
             try:
-                app.AlertResponse = 6
+                app.AlertResponse = 1
             except Exception:
                 pass
         docs = app.Documents
@@ -654,6 +655,12 @@ class VisioEngine:
             except Exception:
                 pass
         finally:
+            # Prevent \"Do you want to save\" prompts on close (user complained they can't close the file).
+            try:
+                if doc is not None:
+                    doc.Saved = True
+            except Exception:
+                pass
             pythoncom.CoUninitialize()
 
     def _safe_bbox(self, shp) -> Optional[Tuple[float, float, float, float]]:
@@ -678,10 +685,11 @@ class VisioEngine:
             # Re-apply prompt suppression right before ungroup (most reliable).
             try:
                 _, _, c = self._com()
-                app.AlertResponse = c.visAlertResponseYes
+                # Ungroup warning is typically OK/Cancel → pick OK.
+                app.AlertResponse = c.visAlertResponseOK
             except Exception:
                 try:
-                    app.AlertResponse = 6
+                    app.AlertResponse = 1
                 except Exception:
                     pass
             # Only groups can be ungrouped; calling on non-groups throws.
@@ -919,6 +927,15 @@ class VisioEngine:
                 raise RuntimeError(f"Stencil file not found: {stencil_path}")
 
             app, _ = self._get_visio()
+            # Ensure prompts don't block replacement
+            try:
+                _, _, c = self._com()
+                app.AlertResponse = c.visAlertResponseOK
+            except Exception:
+                try:
+                    app.AlertResponse = 1
+                except Exception:
+                    pass
             doc = self._get_active_document(app)
             page = self._find_page_by_name(doc, page_name)
             if page is None:
